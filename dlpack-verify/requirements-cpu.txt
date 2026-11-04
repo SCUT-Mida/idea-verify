@@ -1,0 +1,6 @@
+# Windows CPU 验证环境 (实测锁定版本, Python 3.10)
+# 安装: pip install -r requirements-cpu.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+numpy==1.26.4       # 实测必须 <2.0: mindspore 2.11 元数据虽写 numpy>=1.25,
+                    # 但其 Windows wheel 按 numpy 1.x ABI 编译, numpy 2.x 下 Tensor 算术崩溃
+torch==2.5.1        # PyPI 的 Windows wheel 即 CPU 版
+mindspore==2.11.0   # 2.7.0 起 PyPI 恢复 Windows 包; 2.11.0 与 910B 目标版本更接近

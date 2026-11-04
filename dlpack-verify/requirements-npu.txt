@@ -1,0 +1,18 @@
+# 昇腾 910B (Atlas A2) 环境依赖 — 模板, 版本必须按客户环境实际配套后填写!
+#
+# 配套关系查询顺序:
+#   1) 服务器上查 CANN 版本:  cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg (或 aarch64-linux 目录)
+#   2) 按 CANN 版本查 torch_npu 配套表: https://gitee.com/ascend/pytorch 里 "版本配套表"
+#   3) torch_npu 与 torch 必须严格同主版本 (如 torch_npu 2.5.1.post* ↔ torch 2.5.1)
+#   4) MindSpore 选支持 Atlas A2 的版本 (动态图/PYNATIVE 建议 >= 2.3)
+#
+# 安装示例 (aarch64 Linux 上, 假设 CANN 8.x + torch_npu 2.5.1):
+#   pip install numpy==1.26.4
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu   # CPU 版 torch 即可 (算子走 torch_npu)
+#   pip install torch_npu==2.5.1.post1 -i https://pypi.tuna.tsinghua.edu.cn/simple
+#   pip install mindspore==2.3.0 -i https://pypi.tuna.tsinghua.edu.cn/simple    # aarch64 Linux wheel
+#
+numpy==1.26.4
+torch==2.5.1            # TODO: 按配套表确认
+torch_npu==2.5.1.post1  # TODO: 按客户 CANN 版本配套确认 (A2 上必须; 使 DLPack 补丁生效)
+mindspore==2.3.0        # TODO: 按客户环境确认; 若客户为更新版本, 需回归本验证脚本
