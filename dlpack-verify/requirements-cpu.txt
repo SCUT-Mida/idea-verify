@@ -1,6 +1,15 @@
-# Windows CPU 验证环境 (实测锁定版本, Python 3.10)
-# 安装: pip install -r requirements-cpu.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-numpy==1.26.4       # 实测必须 <2.0: mindspore 2.11 元数据虽写 numpy>=1.25,
-                    # 但其 Windows wheel 按 numpy 1.x ABI 编译, numpy 2.x 下 Tensor 算术崩溃
-torch==2.5.1        # PyPI 的 Windows wheel 即 CPU 版
-mindspore==2.11.0   # 2.7.0 起 PyPI 恢复 Windows 包; 2.11.0 与 910B 目标版本更接近
+# Windows CPU verification env (pinned versions, official Python 3.10.11 + project venv)
+# Install (run inside E:\Code\Python\dlpack-verify):
+#   python -m venv .venv                               (skip if .venv already exists)
+#   .venv\Scripts\activate.bat
+#   pip install -r requirements-cpu.txt -i https://repo.huaweicloud.com/repository/pypi/simple/
+# Sanity: `where python` must point into .venv BEFORE installing; if the prompt
+#         shows a venv name but `python -c "import sys; print(sys.prefix)"`
+#         lands in D:\Python\Python310, your activation is stale (ghost venv).
+# NOTE: keep this file ASCII-only. Chinese comments would crash `pip install -r`
+#       on Windows (pip decodes the file with the GBK locale codec).
+numpy==1.26.4        # must stay <2.0: mindspore 2.11 declares numpy>=1.25 but its
+                     # wheel is built against numpy 1.x ABI; numpy 2.x breaks Tensor ops
+torch==2.5.1         # PyPI Windows wheel is the CPU build
+mindspore==2.11.0    # last-but-one Windows wheel line (2.7.0+ publish Windows again);
+                     # chosen to stay close to the 910B target (customer uses 2.10.0)

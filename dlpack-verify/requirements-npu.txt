@@ -1,18 +1,28 @@
-# 昇腾 910B (Atlas A2) 环境依赖 — 模板, 版本必须按客户环境实际配套后填写!
+# Ascend 910B (Atlas A2) deps - pure python/venv, no conda needed
+# Target env (measured): CANN 8.3.RC1 (8.3.0.1.200) / linux-aarch64 / Python 3.10.21
 #
-# 配套关系查询顺序:
-#   1) 服务器上查 CANN 版本:  cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg (或 aarch64-linux 目录)
-#   2) 按 CANN 版本查 torch_npu 配套表: https://gitee.com/ascend/pytorch 里 "版本配套表"
-#   3) torch_npu 与 torch 必须严格同主版本 (如 torch_npu 2.5.1.post* ↔ torch 2.5.1)
-#   4) MindSpore 选支持 Atlas A2 的版本 (动态图/PYNATIVE 建议 >= 2.3)
+# Pairing source: official COMPATIBILITY.md (github.com/Ascend/pytorch)
+#   CANN 8.3.RC1 pairs with: torch_npu 2.8.0 / 2.7.1 / 2.6.0.post3 / 2.1.0.post17
+#   Chosen here: torch 2.7.1 + torch_npu 2.7.1 (stable mainline)
 #
-# 安装示例 (aarch64 Linux 上, 假设 CANN 8.x + torch_npu 2.5.1):
-#   pip install numpy==1.26.4
-#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu   # CPU 版 torch 即可 (算子走 torch_npu)
-#   pip install torch_npu==2.5.1.post1 -i https://pypi.tuna.tsinghua.edu.cn/simple
-#   pip install mindspore==2.3.0 -i https://pypi.tuna.tsinghua.edu.cn/simple    # aarch64 Linux wheel
+# Install on the server (run inside dlpack-verify):
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements-npu.txt
+#   source /usr/local/Ascend/ascend-toolkit/set_env.sh   # REQUIRED before every run!
 #
-numpy==1.26.4
-torch==2.5.1            # TODO: 按配套表确认
-torch_npu==2.5.1.post1  # TODO: 按客户 CANN 版本配套确认 (A2 上必须; 使 DLPack 补丁生效)
-mindspore==2.3.0        # TODO: 按客户环境确认; 若客户为更新版本, 需回归本验证脚本
+# NOTE: keep this file ASCII-only so `pip install -r` works under any locale.
+numpy==1.26.4          # keep <2.0: mindspore wheels are built against numpy 1.x ABI
+torch==2.7.1           # aarch64 PyPI wheel is the CPU build; NPU ops come from torch_npu
+torch_npu==2.7.1       # official pairing for CANN 8.3.RC1; source CANN set_env.sh before import
+mindspore==2.10.0      # same version as the customer env (A2 dynamic graph needs >= 2.10)
+pyyaml                 # torch_npu 2.7.1 imports yaml at runtime but does NOT declare it!
+# --- deps of CANN's "te" toolchain: after `source set_env.sh` the CANN python dir is on
+# --- PYTHONPATH, and MindSpore on Ascend needs these importable for graph compilation:
+decorator
+attrs
+cloudpickle
+ml-dtypes==0.5.1       # MUST stay <0.6: ml-dtypes 0.6 forces numpy>=2.0 and silently
+                       # upgrades numpy, breaking the numpy<2 pin above
+tornado
+absl-py

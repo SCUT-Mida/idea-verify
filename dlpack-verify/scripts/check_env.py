@@ -16,6 +16,13 @@ import platform
 import subprocess
 import sys
 import importlib
+import warnings
+
+# 静音两类已知无害的平台告警 (成因见 README §4.3), 按消息精确匹配, 其他警告仍可见:
+#   - "owner does not match": CANN 由 root 安装而以普通用户运行, torch_npu 环境收集器的提示
+#   - "smallest subnormal":   ARM 容器内核关闭非规格化浮点, numpy 提示 denormal 刷零
+warnings.filterwarnings("ignore", message=".*owner does not match.*")
+warnings.filterwarnings("ignore", message=".*smallest subnormal.*")
 
 REPORT = []
 CRITICAL_MISSING = []
