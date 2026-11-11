@@ -26,3 +26,4 @@ ml-dtypes==0.5.1       # MUST stay <0.6: ml-dtypes 0.6 forces numpy>=2.0 and sil
                        # upgrades numpy, breaking the numpy<2 pin above
 tornado
 absl-py
+openpyxl             # multi-sheet results workbook written by run_all.py at the end

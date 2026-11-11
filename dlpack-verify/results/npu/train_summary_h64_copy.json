@@ -1,5 +1,6 @@
 {
   "kind": "train_hybrid",
+  "version": 3,
   "device": "npu:0",
   "hidden": 64,
   "batch": 128,
@@ -7,34 +8,43 @@
   "steps": 300,
   "seed": 7,
   "exchange": "copy",
+  "topology": "front_ms",
   "rtol": 0.005,
-  "m3_tol": 0.02,
   "results": {
-    "initial_loss_a": 0.15311530232429504,
-    "initial_loss_b": 0.15311530232429504,
-    "final_loss_a": 0.00448827538639307,
-    "final_loss_b": 0.004477296024560928,
-    "ratio_final": 0.9975537682323532,
-    "eval_a": 0.006821471266448498,
-    "eval_b": 0.006813785061240196,
-    "eval_ratio": 0.9988732335139919,
-    "lat_a_ms": 0.9989021345973015,
-    "lat_b_ms": 2.7457743883132935,
-    "lat_ratio": 2.748792192160274,
-    "curve_dev_decades": 0.08680085693211614,
-    "auc_dev_decades": 0.004214766539393233,
-    "exchange_fwd_us": 332.7396512031555,
-    "exchange_bwd_us": 233.2187940677007,
-    "m1": true,
-    "m2": true,
-    "m3": false,
+    "initial_loss": 0.048976898193359375,
+    "final_loss": 0.0040280455723404884,
+    "eval_mse": 0.005527174100279808,
+    "eval_mse_initial": 0.046228308230638504,
+    "gen_gap": 1.3721726830087113,
+    "val_synced": true,
+    "lat_ms": 3.7692747699717684,
+    "exchange_fwd_us": 287.98465927441913,
+    "exchange_bwd_us": 211.08771363894144,
+    "exchange_ratio_pct": 13.240541042251971,
+    "converged": true,
     "m4": true
   },
+  "ms_ref": {
+    "initial_loss": 0.048976898193359375,
+    "final_loss": 0.00403331033885479,
+    "eval_mse": 0.005530398339033127,
+    "eval_mse_initial": 0.046228304505348206,
+    "gen_gap": 1.3711809591630426,
+    "val_synced": true,
+    "lat_ms": 3.07040490830938,
+    "converged": true
+  },
+  "eq": {
+    "final_ratio": 0.998694678546408,
+    "eval_ratio": 0.9994169970125728,
+    "pass": true
+  },
   "m4_calibration": {
-    "rel_err": 0.0,
+    "rel_err": 3.145468326692935e-06,
+    "ms_rel_err": 5.751728622271912e-06,
     "rtol": 0.005,
     "pass": true
   },
   "initial_consistency_dev": 0.0,
-  "generated_at": "2026-11-10T12:33:07"
+  "generated_at": "2026-11-11T11:59:14"
 }

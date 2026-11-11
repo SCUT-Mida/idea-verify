@@ -8,8 +8,8 @@
     "mindspore": "2.10.0",
     "device": "npu:0"
   },
-  "n_pass": 14,
-  "n_total": 14,
+  "n_pass": 17,
+  "n_total": 17,
   "checks": [
     {
       "step": 1,
@@ -94,6 +94,24 @@
       "name": "MindSpore 参数已更新",
       "ok": true,
       "detail": "max|Δw|=4.030e-03"
+    },
+    {
+      "step": 10,
+      "name": "交换边界 scatter 聚合两侧一致 (图语义 C1)",
+      "ok": true,
+      "detail": "rel_err=0.000e+00"
+    },
+    {
+      "step": 11,
+      "name": "稀疏梯度完整性: 未访问行梯度恒为零",
+      "ok": true,
+      "detail": "max|g|_untouched=0.000e+00"
+    },
+    {
+      "step": 11,
+      "name": "稀疏更新后未访问行零变化",
+      "ok": true,
+      "detail": "max|Δ|=0.000e+00"
     }
   ],
   "meas": {
@@ -105,7 +123,9 @@
     "negctrl_diff_w": 1.5149103701114655,
     "pt_moved": 0.00011196732521057129,
     "ms_moved": 0.004030303098261356,
-    "t_dlpack_us": 13.792365789413452,
-    "t_copy_us": 31.15333616733551
+    "t_dlpack_us": 15.97300171852112,
+    "t_copy_us": 32.09792077541351,
+    "rel_graph_agg": 0.0,
+    "emb_untouched_diff": 0.0
   }
 }

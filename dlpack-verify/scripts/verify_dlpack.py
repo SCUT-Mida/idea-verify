@@ -13,6 +13,8 @@ verify_dlpack.py — MindSpore ↔ PyTorch (DLPack) 验证脚本
   STEP 7  负对照: 用 ones_like 代替真实 sens, 梯度应明显不同
   STEP 8  两侧参数均可更新 (PT optim.step / MS set_data)
   STEP 9  交换耗时统计: dlpack 路径 vs 拷贝路径
+  STEP 10 图语义聚合对照 (GNN C1): 交换边界两侧各做一次 scatter 聚合, 结果必须一致
+  STEP 11 稀疏 Embedding 梯度完整性 (GNN C3): 交换路径上未访问行必须零变化
 
 流程图 (5 个关键动作):
   MS: x ─▶ ms_block ─▶ ms_out
@@ -371,6 +373,70 @@ def step9_benchmark(ctx):
 
 
 # ---------------------------------------------------------------------------
+# STEP 10: 图语义聚合对照 (GNN C1: 边界聚合两侧一致)
+# ---------------------------------------------------------------------------
+def step10_graph_semantics(ctx):
+    """GNN 正确性不能只比边界张量数值——聚合语义是否被破坏才是关键。
+    对同一交换边界, 两侧各执行一次 scatter 聚合(MS: unsorted_segment_sum /
+    PT: index_add_), 聚合结果必须一致 (≤1e-5)。"""
+    print("\n--- STEP 10: 图语义聚合对照 (边界 scatter 聚合, 两侧一致) ---")
+    h = np.random.randn(6, 4).astype(np.float32)
+    seg = np.array([0, 1, 0, 2, 1, 2], dtype=np.int32)   # 3 个聚合目标节点
+    try:
+        h_ms = ms.Tensor(h)                              # MS 侧边界张量
+        h_pt = torch_from_dlpack(ms_to_dlpack(h_ms))     # DLPack 交换 (同一内存)
+        # MS 侧聚合 (GNN scatter 的 MS 等价算子)
+        out_ms = ops.unsorted_segment_sum(h_ms, ms.Tensor(seg), 3)
+        # PT 侧聚合 (GNN scatter 的 PT 等价算子), 张量上 device 后执行
+        seg_pt = torch.tensor(seg, device=DEVICE)
+        out_pt = torch.zeros(3, 4, device=DEVICE).index_add_(
+            0, seg_pt, h_pt.to(DEVICE))
+        err = rel_err(to_np(out_pt), out_ms.asnumpy())
+        MEAS["rel_graph_agg"] = err
+        check(10, "交换边界 scatter 聚合两侧一致 (图语义 C1)", err < 1e-5,
+              f"rel_err={err:.3e}")
+    except Exception as e:  # noqa: BLE001
+        check(10, "交换边界 scatter 聚合两侧一致 (图语义 C1)", False,
+              f"异常: {type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# STEP 11: 稀疏 Embedding 梯度完整性 (GNN C3)
+# ---------------------------------------------------------------------------
+def step11_sparse_embedding(ctx):
+    """GNN 的 Embedding 梯度是稀疏的 (仅被采样节点有梯度)。验证跨框架交换
+    路径上: 未访问行的梯度恒为零, 稀疏更新后未访问行数值零变化——否则说明
+    交换引入了错误的内存共享或梯度扩散。"""
+    print("\n--- STEP 11: 稀疏 Embedding 梯度完整性 (未访问行必须零变化) ---")
+    V, D = 8, 4
+    emb = torch.nn.Embedding(V, D).to(DEVICE)
+    ids = torch.tensor([1, 5, 7], device=DEVICE)         # 仅 3 行被访问
+    untouched_before = to_np(emb.weight.detach()).copy()
+    mask = torch.ones(V, dtype=torch.bool)
+    mask[ids] = False
+    try:
+        h = emb(ids)
+        # 嵌入输出经 DLPack 交换到 MS 侧消费 (跨框架路径的一部分)
+        h_ms = ms_from_dlpack(torch_to_dlpack(h.detach()))
+        _read = float(np.sum(h_ms.asnumpy()))            # MS 侧读取 (模拟消费)
+        loss = h.sum()
+        loss.backward()
+        g = to_np(emb.weight.grad)
+        untouched_grad_max = float(np.max(np.abs(g[mask]))) if bool(mask.any()) else 0.0
+        check(11, "稀疏梯度完整性: 未访问行梯度恒为零", untouched_grad_max == 0.0,
+              f"max|g|_untouched={untouched_grad_max:.3e}")
+        # 一次稀疏更新 (手写 SGD, 等价 optim.step 对未访问行的效果)
+        with torch.no_grad():
+            emb.weight.copy_(emb.weight - LR * emb.weight.grad)
+        diff = float(np.max(np.abs(to_np(emb.weight.detach())[mask]
+                                   - untouched_before[mask])))
+        MEAS["emb_untouched_diff"] = diff
+        check(11, "稀疏更新后未访问行零变化", diff == 0.0, f"max|Δ|={diff:.3e}")
+    except Exception as e:  # noqa: BLE001
+        check(11, "稀疏 Embedding 梯度完整性", False, f"异常: {type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # 汇总报告
 # ---------------------------------------------------------------------------
 def report():
@@ -418,6 +484,8 @@ def main():
     step7_negative_control(ctx)
     step8_update_params(ctx)
     step9_benchmark(ctx)
+    step10_graph_semantics(ctx)
+    step11_sparse_embedding(ctx)
 
     return report()
 

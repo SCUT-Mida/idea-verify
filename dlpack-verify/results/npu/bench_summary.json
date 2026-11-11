@@ -1,9 +1,33 @@
 {
   "kind": "bench",
+  "version": 2,
   "device": "npu:0",
-  "fwd_dlpack_us": 14.319904148578644,
-  "fwd_copy_us": 194.91896033287048,
-  "bwd_dlpack_us": 12.911297380924225,
-  "bwd_copy_us": 121.1758702993393,
-  "n": 200
+  "hidden": 64,
+  "n": 200,
+  "sizes": [
+    {
+      "batch": 128,
+      "boundary": "32 KB",
+      "fwd_dlpack_us": 15.048347413539886,
+      "fwd_copy_us": 199.33633506298065,
+      "bwd_dlpack_us": 14.028176665306091,
+      "bwd_copy_us": 120.91703712940216
+    },
+    {
+      "batch": 4096,
+      "boundary": "1.0 MB",
+      "fwd_dlpack_us": 14.858581125736237,
+      "fwd_copy_us": 716.8834283947945,
+      "bwd_dlpack_us": 114.38943445682526,
+      "bwd_copy_us": 612.0282039046288
+    },
+    {
+      "batch": 16384,
+      "boundary": "4.0 MB",
+      "fwd_dlpack_us": 14.84747976064682,
+      "fwd_copy_us": 1974.7381657361984,
+      "bwd_dlpack_us": 432.74983763694763,
+      "bwd_copy_us": 1936.0287487506866
+    }
+  ]
 }

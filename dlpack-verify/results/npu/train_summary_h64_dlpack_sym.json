@@ -1,0 +1,50 @@
+{
+  "kind": "train_hybrid",
+  "version": 3,
+  "device": "npu:0",
+  "hidden": 64,
+  "batch": 128,
+  "lr": 0.05,
+  "steps": 300,
+  "seed": 7,
+  "exchange": "dlpack",
+  "topology": "front_pt",
+  "rtol": 0.005,
+  "results": {
+    "initial_loss": 0.048976898193359375,
+    "final_loss": 0.004033311270177364,
+    "eval_mse": 0.005530398339033127,
+    "eval_mse_initial": 0.046228304505348206,
+    "gen_gap": 1.3711806425468194,
+    "val_synced": true,
+    "lat_ms": 2.7553862271209555,
+    "exchange_fwd_us": 62.0947778224945,
+    "exchange_bwd_us": 43.575093150138855,
+    "exchange_ratio_pct": 3.8350293665743393,
+    "converged": true,
+    "m4": true
+  },
+  "ms_ref": {
+    "initial_loss": 0.048976898193359375,
+    "final_loss": 0.004033311270177364,
+    "eval_mse": 0.005530398339033127,
+    "eval_mse_initial": 0.046228304505348206,
+    "gen_gap": 1.3711806425468194,
+    "val_synced": true,
+    "lat_ms": 3.213191063453754,
+    "converged": true
+  },
+  "eq": {
+    "final_ratio": 1.0,
+    "eval_ratio": 1.0,
+    "pass": true
+  },
+  "m4_calibration": {
+    "rel_err": 9.888204886010499e-07,
+    "ms_rel_err": 1.6375880704799783e-06,
+    "rtol": 0.005,
+    "pass": true
+  },
+  "initial_consistency_dev": 0.0,
+  "generated_at": "2026-11-11T12:37:12"
+}

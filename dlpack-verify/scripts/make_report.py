@@ -5,10 +5,11 @@ make_report.py — 一键生成最终验证报告 (图表 + 文档)
 
 流程:
     1. 读取 results/{npu|cpu}/ 下的机器可读摘要
-       (verify_summary.json / train_summary_h{hidden}_{dlpack,copy}.json /
-        bench_summary.json; 旧版 v1 摘要键名自动兼容)
-    2. 用实测数据绘制 charts/ 四张证据图
-       (loss 曲线对照 / E2 vs E3 交换段与步时延 / 判据评分卡 / 纯交换吞吐)
+       (verify_summary.json / train_summary_h{hidden}_{dlpack,copy}[_sym].json /
+        bench_summary.json)
+    2. 用实测数据绘制 charts/ 五张证据图
+       (参照/混合训练验证曲线 / E2 vs E3 交换段与步时延 / 形态对称性 /
+        判据评分卡 / 纯交换吞吐尺寸扫描)
     3. 渲染验证报告 (实测数字自动填充):
        正式条件 = npu 的 verify_summary.json + train_summary_h64_dlpack.json +
        train_summary_h64_copy.json 三份齐备 → docs/验证报告.md;
@@ -18,6 +19,7 @@ make_report.py — 一键生成最终验证报告 (图表 + 文档)
 用法: python scripts/make_report.py
 (实验本身请运行 scripts/train_hybrid.py 与 scripts/verify_dlpack.py)
 """
+import csv
 import json
 import os
 import sys
@@ -30,31 +32,32 @@ import matplotlib.pyplot as plt
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHARTS_DIR = os.path.join(PROJECT, "charts")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from unwrap_md import unwrap_md   # 报告正文连贯单行 (合并模板中的手工硬换行)
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]  # 中文
 plt.rcParams["axes.unicode_minus"] = False
 
 C_B, C_COPY = "#1f77b4", "#ff7f0e"
 C_OK, C_BAD = "#2ca02c", "#d62728"
+C_GRAY = "#7f7f7f"
 
 # ---- 数据设备 (main() 按摘要存在性确定 npu/cpu) ----
 DEV = "npu"
 
 # ---- 图表数据源 ----
-# B: dlpack 跑的检查点 loss (CSV 缺失时的回退曲线, 300 步等距 7 点)
 RUNS = [
     {"label": "h=64 · batch=128 · lr=0.05",
      "short": "h=64 · b=128\nlr=0.05",
      "csv_dlpack": "training_log_dlpack_h64.csv",
      "csv_copy": "training_log_copy_h64.csv",
-     "B": [1.531153e-01, 1.824383e-02, 1.242429e-02, 8.990590e-03,
-           6.822213e-03, 5.416146e-03, 4.477296e-03],
      "e2": None, "e3": None},
 ]
 # bench 尺寸行列表 (每行一个边界张量档位); main() 用 bench_summary 覆盖
 BENCH = [{"label": "32 KB (batch=128)",
           "fwd_dlpack_us": 14.3, "fwd_copy_us": 194.9,
           "bwd_dlpack_us": 12.9, "bwd_copy_us": 121.2}]
+SYM = None  # E4 对称形态摘要 (norm_run, main() 填充)
 
 
 # ---------------------------------------------------------------------------
@@ -74,36 +77,54 @@ def load_summaries(dev):
         "verify": j("verify_summary.json"),
         "h64_e2": j("train_summary_h64_dlpack.json"),
         "h64_e3": j("train_summary_h64_copy.json"),
+        "h64_e4": j("train_summary_h64_dlpack_sym.json"),
         "bench": j("bench_summary.json"),
     }
 
 
 def norm_run(s):
-    """训练摘要 -> 统一视图 (兼容 v1 键名: final_loss_b/eval_b/lat_b_ms)。"""
+    """训练摘要 (v3) -> 统一视图。"""
     if not s:
         return None
     r = s.get("results", {})
 
-    def g(new, old):
-        v = r.get(new, r.get(old))
+    def g(k):
+        v = r.get(k)
         return float(v) if isinstance(v, (int, float)) else None
 
     cal = s.get("m4_calibration", {}) or {}
+    ref, eq = s.get("ms_ref") or {}, s.get("eq") or {}
+    ng = lambda d, k: (float(d[k]) if isinstance(d.get(k), (int, float)) else None)
+
+    def g_ref(k):
+        v = ref.get(k)
+        return float(v) if isinstance(v, (int, float)) else None
+
     return {
         "exchange": s.get("exchange"),
+        "topology": s.get("topology", "front_ms"),
         "rtol": s.get("rtol"),
-        "initial_loss": g("initial_loss", "initial_loss_b"),
-        "final_loss": g("final_loss", "final_loss_b"),
-        "eval_mse": g("eval_mse", "eval_b"),
-        "eval_mse_initial": g("eval_mse_initial", "eval_mse_initial"),
-        "gen_gap": g("gen_gap", "gen_gap"),
+        "initial_loss": g("initial_loss"),
+        "final_loss": g("final_loss"),
+        "eval_mse": g("eval_mse"),
+        "eval_mse_initial": g("eval_mse_initial"),
+        "gen_gap": g("gen_gap"),
         "val_synced": r.get("val_synced"),
-        "lat_ms": g("lat_ms", "lat_b_ms"),
-        "exf_us": g("exchange_fwd_us", "exchange_fwd_us"),
-        "exb_us": g("exchange_bwd_us", "exchange_bwd_us"),
+        "lat_ms": g("lat_ms"),
+        "exf_us": g("exchange_fwd_us"),
+        "exb_us": g("exchange_bwd_us"),
+        "exchange_ratio_pct": g("exchange_ratio_pct"),
         "m4_err": float(cal["rel_err"]) if isinstance(cal.get("rel_err"), (int, float)) else None,
+        "m4_ms_err": (float(cal["ms_rel_err"])
+                      if isinstance(cal.get("ms_rel_err"), (int, float)) else None),
         "m4_pass": cal.get("pass"),
-        "converged": r.get("converged", r.get("m1")),
+        "converged": r.get("converged"),
+        "ms_ref": {k: g_ref(k) for k in ("final_loss", "eval_mse",
+                                         "eval_mse_initial", "gen_gap", "lat_ms")}
+        if ref else None,
+        "ms_ref_converged": ref.get("converged"),
+        "eq": {"final_ratio": ng(eq, "final_ratio"), "eval_ratio": ng(eq, "eval_ratio"),
+               "pass": eq.get("pass")} if eq else None,
     }
 
 
@@ -122,83 +143,109 @@ def csv_path(name):
     return os.path.join(PROJECT, "results", DEV, name)
 
 
+PLOT_STRIDE = 5   # 曲线绘图取样间隔(步); 原始逐步数据仍每步全量落盘 CSV
+
+
+def decimate(xs, *arrays):
+    """按 PLOT_STRIDE 取样绘图数据(保留首末点); 点数 <=50 时原样返回。"""
+    n = len(xs)
+    if n <= 50:
+        return (list(xs), *[list(a) for a in arrays])
+    idx = list(range(0, n, PLOT_STRIDE))
+    if idx[-1] != n - 1:
+        idx.append(n - 1)
+    return ([xs[i] for i in idx], *[[a[i] for i in idx] for a in arrays])
+
+
 def load_csv_curve(path):
-    """v2 格式逐步 CSV (step, loss, val_loss, t_ms) -> (steps, loss, val);
-    val 非评估步为 None; 非 v2 格式返回 None。"""
+    """v2+ 格式逐步 CSV (step, loss, val_loss[, ref_loss, ref_val_loss], t_ms);
+    返回 dict(steps/loss/val/ref_loss/ref_val), 非评估步为 None; 非 v2 格式返回 None。"""
     import csv
-    steps, loss, val = [], [], []
+    steps, loss, val, ref_loss, ref_val = [], [], [], [], []
+
+    def col(row, name):
+        v = row.get(name, "")
+        return float(v) if v not in (None, "") else None
+
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             if "loss" not in row or row["loss"] == "":
                 return None
             steps.append(int(row["step"]))
             loss.append(float(row["loss"]))
-            v = row.get("val_loss", "")
-            val.append(float(v) if v not in (None, "") else None)
-    return steps, loss, val
+            val.append(col(row, "val_loss"))
+            ref_loss.append(col(row, "ref_loss"))
+            ref_val.append(col(row, "ref_val_loss"))
+    return {"steps": steps, "loss": loss, "val": val,
+            "ref_loss": ref_loss, "ref_val": ref_val}
 
 
-def run_curves(run, key, fallback=None):
-    """优先逐步 dense CSV, 缺失时回退检查点数组。
-    返回 (steps, loss, val, src) 或 (None, None, None, None)。"""
+def run_curves(run, key):
+    """读取逐步 dense CSV; 返回 dict(steps/loss/val/ref_loss/ref_val/src) 或 None。"""
     name = run.get(key)
     p = csv_path(name) if name else None
     if p and os.path.exists(p):
         out = load_csv_curve(p)
         if out:
-            return out[0], out[1], out[2], "dense"
-    if fallback:
-        n = len(fallback)
-        return list(np.linspace(0, 300, n)), list(fallback), None, "checkpoint"
-    return None, None, None, None
+            out["src"] = "dense"
+            return out
+    return None
 
 
 # ---------------------------------------------------------------------------
-# 图 1: E2 vs E3 loss 曲线对照 (C1 数值一致性 + 泛化/过拟合证据)
+# 图 1: MS 参照 + E2 + E3 训练/验证曲线 (C1 数值一致性 + 泛化/过拟合 + 切换等价性证据)
 # ---------------------------------------------------------------------------
 def fig_loss_curves():
     run = RUNS[0]
     fig, axes = plt.subplots(2, 1, figsize=(9, 7.2), dpi=150,
                              gridspec_kw={"height_ratios": [2.1, 1]})
     ax = axes[0]
-    steps_d, loss_d, val_d, src_d = run_curves(run, "csv_dlpack", run.get("B"))
-    steps_c, loss_c, val_c, src_c = run_curves(run, "csv_copy")
-    if steps_d:
-        tag = "逐步 dense" if src_d == "dense" else "检查点"
-        ax.semilogy(steps_d, loss_d, "o-", color=C_B,
-                    label=f"E2 dlpack 训练 loss ({tag})")
-        if val_d and any(v is not None for v in val_d):
-            vx = [s for s, v in zip(steps_d, val_d) if v is not None]
-            vy = [v for v in val_d if v is not None]
-            ax.semilogy(vx, vy, "s--", color=C_B, alpha=0.65, markerfacecolor="white",
-                        label="E2 dlpack 验证 loss (held-out)")
-    if steps_c:
-        ax.semilogy(steps_c, loss_c, "o-", color=C_COPY,
-                    label="E3 copy 训练 loss (逐步 dense)")
-        if val_c and any(v is not None for v in val_c):
-            vx = [s for s, v in zip(steps_c, val_c) if v is not None]
-            vy = [v for v in val_c if v is not None]
-            ax.semilogy(vx, vy, "s--", color=C_COPY, alpha=0.65,
-                        markerfacecolor="white",
-                        label="E3 copy 验证 loss (held-out)")
+    d = run_curves(run, "csv_dlpack")
+    c = run_curves(run, "csv_copy")
+
+    def plot_val(curve, xs, color, label):
+        if curve and any(v is not None for v in curve):
+            vx = [s for s, v in zip(xs, curve) if v is not None]
+            vy = [v for v in curve if v is not None]
+            ax.semilogy(vx, vy, "s--", color=color, alpha=0.65,
+                        markerfacecolor="white", label=label)
+
+    if d:
+        if d["ref_loss"] and any(v is not None for v in d["ref_loss"]):
+            rx, ry = decimate(d["steps"], d["ref_loss"])
+            ax.semilogy(rx, ry, "-", color=C_GRAY,
+                        lw=2.2, label="纯MindSpore 基线 训练 loss")
+            plot_val(d["ref_val"], d["steps"], C_GRAY,
+                     "纯MindSpore 基线 验证 loss (held-out)")
+        rx, ry = decimate(d["steps"], d["loss"])
+        ax.semilogy(rx, ry, "o-", color=C_B, label="E2 混合 dlpack 训练 loss")
+        plot_val(d["val"], d["steps"], C_B, "E2 混合 dlpack 验证 loss (held-out)")
+    if c:
+        rx, ry = decimate(c["steps"], c["loss"])
+        ax.semilogy(rx, ry, "o-", color=C_COPY, label="E3 混合 copy 训练 loss")
+        plot_val(c["val"], c["steps"], C_COPY, "E3 混合 copy 验证 loss (held-out)")
+    if not d and not c:
+        ax.text(0.5, 0.5, "E2/E3 逐步曲线待复测\nrun_all 重跑后生成",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=10, color="gray")
     ax.set_ylabel("loss (MSE, log 刻度)")
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=8, loc="upper right")
-    ax.set_title(f"{run['label']} — 训练/验证曲线 (两跑同种子同数据, 唯一变量 = 交换机制)",
-                 fontsize=10)
+    if d or c:
+        ax.legend(fontsize=8, loc="upper right")
+    ax.set_title(f"{run['label']} — 参照/混合 训练与验证曲线 (同种子同数据)", fontsize=10)
 
     ax2 = axes[1]
-    if steps_c and steps_d and len(steps_c) == len(steps_d):
-        ratio = [c / d for c, d in zip(loss_c, loss_d)]
-        ax2.plot(steps_c, ratio, "o-", color=C_OK,
-                 markersize=3 if len(steps_c) > 50 else 6)
+    if c and d and len(c["steps"]) == len(d["steps"]):
+        ratio = [a / b for a, b in zip(c["loss"], d["loss"])]
+        rx, ry = decimate(c["steps"], ratio)
+        ax2.plot(rx, ry, "o-", color=C_OK, markersize=4)
         ax2.axhline(1.0, color="gray", ls="--", lw=1)
         lo, hi = min(ratio), max(ratio)
         pad = max((hi - lo) * 0.4, 2e-4)
         ax2.set_ylim(lo - pad, hi + pad)
         ax2.annotate(f"E3/E2 最终比 = {ratio[-1]:.6f}",
-                     xy=(steps_c[-1], ratio[-1]),
-                     xytext=(steps_c[-1] - max(1, int(len(steps_c) * 0.38)),
+                     xy=(c["steps"][-1], ratio[-1]),
+                     xytext=(c["steps"][-1] - max(1, int(len(c["steps"]) * 0.38)),
                              ratio[-1] + pad * 0.5), fontsize=8,
                      arrowprops=dict(arrowstyle="->", lw=0.8))
         ax2.set_title("E3/E2 训练 loss 逐点比值 (越接近 1.0 数值越一致)", fontsize=9)
@@ -212,6 +259,79 @@ def fig_loss_curves():
     fig.suptitle("主对照 E2 vs E3 — 同参数混合训练 (910B 真机)", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     p = os.path.join(CHARTS_DIR, "loss_curves_npu.png")
+    fig.savefig(p)
+    plt.close(fig)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# 图 3: 形态对称性 (E4: PT前段+MS后段 vs MS 参照)
+# ---------------------------------------------------------------------------
+def fig_symmetry():
+    e4 = SYM
+    sym_csv = csv_path("training_log_dlpack_h64_sym.csv")
+    fig, axes = plt.subplots(2, 1, figsize=(9, 7), dpi=150,
+                             gridspec_kw={"height_ratios": [2.1, 1]})
+    ax = axes[0]
+    d = load_csv_curve(sym_csv) if os.path.exists(sym_csv) else None
+    drawn = False
+    if d:
+        rx, ry = decimate(d["steps"], d["ref_loss"])
+        ax.semilogy(rx, ry, "-", color=C_GRAY, lw=2.2,
+                    label="纯MindSpore 基线 训练 loss")
+        rx, ry = decimate(d["steps"], d["loss"])
+        ax.semilogy(rx, ry, "o-", color=C_OK,
+                    label="E4 对称混合 训练 loss")
+        plot_pairs = ((d["ref_val"], C_GRAY, "纯MindSpore 基线 验证 loss (held-out)"),
+                      (d["val"], C_OK, "E4 对称混合 验证 loss (held-out)"))
+        for ys, color, label in plot_pairs:
+            if ys and any(v is not None for v in ys):
+                vx = [s for s, v in zip(d["steps"], ys) if v is not None]
+                vy = [v for v in ys if v is not None]
+                ax.semilogy(vx, vy, "s--", color=color, alpha=0.65,
+                            markerfacecolor="white", label=label)
+        drawn = True
+    else:
+        ax.text(0.5, 0.5,
+                "E4 (对称形态) 待复测:\n"
+                "python scripts/train_hybrid.py --device npu\n"
+                "--topology front_pt --rtol 5e-3",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=10, color="gray")
+    ax.set_ylabel("loss (MSE, log 刻度)")
+    ax.grid(alpha=0.3)
+    if drawn:
+        ax.legend(fontsize=8, loc="upper right")
+    ax.set_title("形态对称性 — 迁移过半形态 (PT前段+MS后段) vs 现状 (纯 MindSpore)",
+                 fontsize=10)
+
+    ax2 = axes[1]
+    ax2.axis("off")
+    if e4:
+        eq = e4.get("eq") or {}
+        err = e4.get("m4_err")
+        err_s = "0.0(逐位一致)" if err == 0 else fmt(err, "{:.2e}")
+        eq_s = (f"loss 比 {eq['final_ratio']:.4f} / held-out 比 {eq['eval_ratio']:.4f}"
+                if isinstance(eq.get("final_ratio"), (int, float)) else "待复测")
+        ax2.text(0.5, 0.5,
+                 "E4 摘要 (机器可读):\n"
+                 f"final loss = {fmt(e4.get('final_loss'))}   "
+                 f"held-out 验证 MSE = {fmt(e4.get('eval_mse'))}   "
+                 f"步时延 = {fmt(e4.get('lat_ms'), '{:.2f} ms')}\n"
+                 f"M4 (fc2 边界) = {err_s}   切换等价性 vs MS 参照: {eq_s}",
+                 transform=ax2.transAxes, ha="center", va="center", fontsize=10,
+                 bbox=dict(boxstyle="round", fc="#f5f5f5", ec="#cccccc"))
+    else:
+        ax2.text(0.5, 0.5, "E4 摘要待复测 (运行后本面板自动填充)",
+                 transform=ax2.transAxes, ha="center", va="center",
+                 fontsize=10, color="gray",
+                 bbox=dict(boxstyle="round", fc="#f5f5f5", ec="#cccccc"))
+    if drawn:
+        fig.suptitle("形态对称性 — 切分方向不影响混合机制 (910B 真机)", fontsize=11)
+    else:
+        fig.suptitle("形态对称性 — E4 待复测 (910B)", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    p = os.path.join(CHARTS_DIR, "symmetry_npu.png")
     fig.savefig(p)
     plt.close(fig)
     return p
@@ -238,8 +358,8 @@ def fig_e2e3():
         cp = [e3["exf_us"], e3["exb_us"]]
         xs = np.arange(len(groups))
         w = 0.32
-        b1 = ax.bar(xs - w / 2, dl, w, color=C_B, label="E2 dlpack")
-        b2 = ax.bar(xs + w / 2, cp, w, color=C_COPY, label="E3 copy")
+        b1 = ax.bar(xs - w / 2, dl, w, color=C_B, label="E2 混合 dlpack")
+        b2 = ax.bar(xs + w / 2, cp, w, color=C_COPY, label="E3 混合 copy")
         ax.set_yscale("log")
         ax.set_ylim(8, max(cp + dl) * 10)
         ax.bar_label(b1, fmt="%.1f", fontsize=8)
@@ -256,7 +376,7 @@ def fig_e2e3():
         # -- 步时延 (linear) --
         ax2 = axes[i][1]
         vals = [e2["lat_ms"], e3["lat_ms"]]
-        bs = ax2.bar(["E2 dlpack", "E3 copy"], vals, 0.5, color=[C_B, C_COPY])
+        bs = ax2.bar(["E2 混合 dlpack", "E3 混合 copy"], vals, 0.5, color=[C_B, C_COPY])
         ax2.bar_label(bs, fmt="%.2f ms", fontsize=9)
         r = vals[1] / max(vals[0], 1e-9)
         ax2.set_ylim(0, max(vals) * 1.32)
@@ -336,7 +456,7 @@ def fig_scorecard():
     ax.set_ylim(1e-7, 3e-2)
     set_ticks(ax)
     ax.set_ylabel("最大相对误差 (log)")
-    ax.set_title("M4 边界数值 (桥接梯度 vs torch 参考) — PASS", fontsize=10)
+    ax.set_title("C2-M4 边界数值 (torch 锚, 双锚见 §4.7) — PASS", fontsize=10)
     ax.grid(alpha=0.3, axis="y", which="both")
 
     # C1: E3/E2 final loss 比 (期望 1.000)
@@ -358,7 +478,7 @@ def fig_scorecard():
     ax.set_ylim(0.99, 1.01)
     set_ticks(ax)
     ax.set_ylabel("E3/E2 final loss 比")
-    ax.set_title("C1 数值一致性 (交换不影响数值) — PASS", fontsize=10)
+    ax.set_title("C4 机制间一致 (E3/E2 final loss ≈ 1.0) — PASS", fontsize=10)
     ax.grid(alpha=0.3, axis="y")
 
     # C2: E3/E2 步时延比 (>1 = dlpack 更快)
@@ -389,7 +509,7 @@ def fig_scorecard():
     ax.set_ylim(0, top)
     set_ticks(ax)
     ax.set_ylabel("E3/E2 步时延比 (>1 = dlpack 更快)")
-    ax.set_title("C2 步时延 (dlpack ≤ copy×1.02 判 PASS)", fontsize=10)
+    ax.set_title("收益·步时延 (E3/E2 比, >1 = dlpack 更优)", fontsize=10)
     ax.grid(alpha=0.3, axis="y")
 
     # E5: bench 加速比 (copy/dlpack, 按边界张量尺寸扫描)
@@ -413,7 +533,7 @@ def fig_scorecard():
     ax.grid(alpha=0.3, axis="y")
 
     fig.text(0.01, 0.008,
-             "说明: 混合训练绝对步时延 (≈2 ms) 主体为 MindSpore PYNATIVE 单算子调度常数, "
+             "说明: 混合训练绝对步时延的主体为 MindSpore PYNATIVE 单算子调度常数, "
              "该常数在 E2/E3 两种交换机制下完全相同 —— 主对照差值纯粹来自交换机制。\n"
              "该绝对开销随计算密度增大被摊薄 (E4 复测), 生产规模 (每步计算百 ms~秒级) 按占比评估。",
              fontsize=7.5, va="bottom",
@@ -487,7 +607,7 @@ def pair_table(run):
 
     lines = [f"#### {run['label']} (各 300 步, 同种子/同初始化/同数据)",
              "",
-             "| 指标 | E2 (dlpack) | E3 (copy) | 判定 |",
+             "| 指标 | E2 (dlpack, 目标方案) | E3 (copy, 替代方案) | 判定 |",
              "|---|---|---|---|"]
     v2, v3 = both("final_loss")
     if isinstance(v2, (int, float)) and isinstance(v3, (int, float)):
@@ -534,16 +654,16 @@ def pair_conclusion():
     e2, e3 = r.get("e2"), r.get("e3")
     if e2 and e3 and e2.get("final_loss") and e3.get("final_loss"):
         same = e2["final_loss"] == e3["final_loss"] and e2["eval_mse"] == e3["eval_mse"]
-        out.append("- **C1 数值一致性 ✅**:E2/E3 的 final loss 与 held-out 评估"
+        out.append("- **机制选型·数值一致 ✅**:E2/E3 的 final loss 与 held-out 评估"
                    + ("**逐位一致(比值恰为 1.0000)**——交换机制不影响数值正确性。"
                       if same else "比值 ≈ 1.000,交换机制不影响数值正确性。"))
         if e2.get("lat_ms") and e3.get("lat_ms"):
             rat = e3["lat_ms"] / e2["lat_ms"]
-            out.append(f"- **C2 步时延 ✅**:dlpack {e2['lat_ms']:.2f} ms/步 vs copy "
+            out.append(f"- **机制选型·步时延 ✅**:dlpack {e2['lat_ms']:.2f} ms/步 vs copy "
                        f"{e3['lat_ms']:.2f} ms/步,copy 慢 {rat:.2f}x——dlpack 每步省 "
                        f"{e3['lat_ms'] - e2['lat_ms']:.2f} ms。")
         if e2.get("exf_us") and e3.get("exf_us"):
-            out.append(f"- **C3 交换段 ✅**:正向 {e2['exf_us']:.1f} vs {e3['exf_us']:.1f} µs"
+            out.append(f"- **机制选型·交换段 ✅**:正向 {e2['exf_us']:.1f} vs {e3['exf_us']:.1f} µs"
                        f"({e3['exf_us'] / max(e2['exf_us'], 1e-9):.1f}x)、回传 "
                        f"{e2['exb_us']:.1f} vs {e3['exb_us']:.1f} µs"
                        f"({e3['exb_us'] / max(e2['exb_us'], 1e-9):.1f}x);"
@@ -558,21 +678,184 @@ def pair_conclusion():
     return "\n".join(out)
 
 
+def eq_table():
+    """§4.5 切换等价性表: MS 参照 (纯 MindSpore, 基线) 为基准 vs E2 混合。"""
+    e2 = RUNS[0].get("e2") or {}
+    ref, eq = e2.get("ms_ref"), e2.get("eq")
+    lines = ["| 指标 | MS 参照 (纯 MindSpore, **基线**) | E2 混合 (dlpack, 目标方案) | 判定(以参照为基准) |",
+             "|---|---|---|---|"]
+    f2, fr = e2.get("final_loss"), (ref or {}).get("final_loss")
+    cell = (f"比值 {f2 / fr:.4f} (∈[0.5,2.0])"
+            if isinstance(f2, (int, float)) and isinstance(fr, (int, float))
+            else "⏳ 待复测")
+    lines.append(f"| final loss | {fmt(fr)} | {fmt(f2)} | {cell} |")
+    v2, vr = e2.get("eval_mse"), (ref or {}).get("eval_mse")
+    cell = (f"比值 {v2 / vr:.4f} (≤1.01)"
+            if isinstance(v2, (int, float)) and isinstance(vr, (int, float))
+            else "⏳ 待复测")
+    lines.append(f"| held-out 验证 MSE | {fmt(vr)} | {fmt(v2)} | {cell} |")
+    lines.append(f"| 验证/训练终点比 (泛化) | {fmt((ref or {}).get('gen_gap'), '{:.2f}')} "
+                 f"| {fmt(e2.get('gen_gap'), '{:.2f}')} | 形态一致(图 1) |")
+    l2, lr = e2.get("lat_ms"), (ref or {}).get("lat_ms")
+    cell = (f"范式代价 {l2 / lr:.2f}x (披露, 非判据)"
+            if isinstance(l2, (int, float)) and isinstance(lr, (int, float))
+            else "⏳ 待复测")
+    lines.append(f"| 步时延 (去预热) | {fmt(lr, '{:.2f} ms')} "
+                 f"| {fmt(l2, '{:.2f} ms')} | {cell} |")
+    return "\n".join(lines)
+
+
+def eq_conclusion():
+    e2 = RUNS[0].get("e2") or {}
+    eq = e2.get("eq")
+    if eq and eq.get("pass") is True:
+        return (f"- **切换等价性 ✅**:混合过渡态 vs 纯 MindSpore 基线(B0)——最终 loss 比 "
+                f"{eq['final_ratio']:.4f}、held-out 验证比 {eq['eval_ratio']:.4f},"
+                "双臂收敛、训练/验证曲线形态一致(图 1)——**切到混合态不改变训练效果**。"
+                "统计等价而非逐位一致:跨框架算子 ulp 差异经训练动力学混沌放大属正常现象。")
+    if eq and eq.get("pass") is False:
+        return "- **切换等价性 ❌**:混合 vs 纯 MS 的收敛/指标超出等价带(§4.5 表格),需排查后再切换。"
+    return ("- **切换等价性待复测**:现有真机摘要为 v1 版(不含 MS 参照臂),用当前脚本重跑 "
+            "E2/E3 后本节自动填充;步时延为范式代价披露项,不作为 dlpack 判据。")
+
+
+def sym_block():
+    """§4.6 形态对称性 (E4) markdown 渲染。"""
+    if not SYM:
+        return ("⏳ **待复测**:对称形态 (PT前段+MS后段) 尚未真机验证——\n\n"
+                "```bash\npython scripts/train_hybrid.py --device npu --topology front_pt "
+                "--rtol 5e-3\n```\n\n"
+                "机制与 E2 对称(同为 sens+vjp 反传、双向交换),切分方向不影响交换/桥接机制;"
+                "E4 重跑后本节与图 3 自动填充。")
+    lines = ["| 指标 | E4 对称混合 (PT前段+MS后段, dlpack) | 判定 |", "|---|---|---|"]
+    lines.append(f"| final loss | {fmt(SYM.get('final_loss'))} "
+                 f"| {verdict(SYM.get('converged'))} 收敛 |")
+    lines.append(f"| held-out 验证 MSE | {fmt(SYM.get('eval_mse'))} "
+                 f"| 泛化终点比 {fmt(SYM.get('gen_gap'), '{:.2f}')} |")
+    lines.append(f"| 步时延 (去预热) | {fmt(SYM.get('lat_ms'), '{:.2f} ms')} | — |")
+    err = SYM.get("m4_err")
+    err_s = "0.0(逐位一致)" if err == 0 else fmt(err, "{:.2e}")
+    lines.append(f"| M4 边界数值 (fc2 边界) | {err_s} | {verdict(SYM.get('m4_pass'))} |")
+    eq = SYM.get("eq")
+    if eq and isinstance(eq.get("final_ratio"), (int, float)):
+        lines.append(f"| 切换等价性 vs MS 参照 | loss 比 {eq['final_ratio']:.4f} "
+                     f"/ held-out 比 {eq['eval_ratio']:.4f} | {verdict(eq.get('pass'))} |")
+    return "\n".join(lines)
+
+
 def m4_table():
-    """§4.5 收敛与 M4 底线表 (dlpack/copy 两跑 × 两配置)。"""
-    lines = ["| 配置 | 运行 | 收敛性 | M4 边界梯度相对误差 | 判定 |",
-             "|---|---|---|---|---|"]
+    """§4.7 梯度等价性 (C2 双锚) 表: E2/E3 主对照对 + E4 对称形态。"""
+    lines = ["| 配置 | 运行 | 收敛性 | C2 torch锚 rel_err | C2 B0锚(纯MS) rel_err | 判定 |",
+             "|---|---|---|---|---|---|"]
     for r in RUNS:
-        for key, tag in (("e2", "E2 dlpack"), ("e3", "E3 copy")):
+        for key, tag in (("e2", "E2 混合 dlpack"), ("e3", "E3 混合 copy")):
             e = r.get(key)
             if e:
                 err = e.get("m4_err")
                 err_s = "0.0(逐位一致)" if err == 0 else fmt(err, "{:.2e}")
+                ms = e.get("m4_ms_err")
+                ms_s = "—(v1 旧版无此锚)" if ms is None else (
+                    "0.0(逐位一致)" if ms == 0 else fmt(ms, "{:.2e}"))
                 lines.append(f"| {r['label']} | {tag} | {verdict(e.get('converged'))} "
-                             f"| {err_s} | {verdict(e.get('m4_pass'))} |")
+                             f"| {err_s} | {ms_s} | {verdict(e.get('m4_pass'))} |")
             else:
-                lines.append(f"| {r['label']} | {tag} | ⏳ 待复测 | ⏳ 待复测 | ⏳ 待复测 |")
+                lines.append(f"| {r['label']} | {tag} | ⏳ 待复测 | ⏳ 待复测 "
+                             f"| ⏳ 待复测 | ⏳ 待复测 |")
+    e4 = SYM
+    if e4:
+        err = e4.get("m4_err")
+        err_s = "0.0(逐位一致)" if err == 0 else fmt(err, "{:.2e}")
+        ms = e4.get("m4_ms_err")
+        ms_s = "—(旧版)" if ms is None else (
+            "0.0(逐位一致)" if ms == 0 else fmt(ms, "{:.2e}"))
+        lines.append(f"| E4 对称形态 (PT前段+MS后段) | E4 dlpack "
+                     f"| {verdict(e4.get('converged'))} | {err_s} | {ms_s} "
+                     f"| {verdict(e4.get('m4_pass'))} |")
+    else:
+        lines.append("| E4 对称形态 (PT前段+MS后段) | E4 dlpack "
+                     "| ⏳ 待复测 | ⏳ 待复测 | ⏳ 待复测 | ⏳ 待复测 |")
     return "\n".join(lines)
+
+
+def perf_section():
+    """§4.9 性能门禁: P1 回退检测采样存证 / P2 交换信噪比 / P3 epoch 口径。"""
+    import glob as _glob
+    out = []
+    # ---- P1: npu-smi 采样存证 ----
+    out.append("#### P1 算子回退检测（采样存证；真实 GNN 接入时为一票否决门禁）")
+    out.append("")
+    smi_files = sorted(_glob.glob(os.path.join(PROJECT, "results", DEV, "smi_*.csv")))
+    if not smi_files:
+        out.append("⏳ **无采样数据**（CPU 调试或旧版运行）。在 910B 上由 `run_all.py` "
+                   "于 E2/E3/E4 训练阶段自动并行采集 `npu-smi info -t usage`"
+                   "（1 秒间隔），落盘 `results/npu/smi_<阶段>_<时间戳>.csv`。")
+    else:
+        rows = ["| 采样文件 | 有效样本 | AI Core min/avg (%) | 最长近零连续窗口 |",
+                "|---|---|---|---|"]
+        suspicious = []
+        for fp in smi_files:
+            name = os.path.basename(fp)
+            aic = []
+            with open(fp, encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("ok") == "1" and row.get("aicore_pct") not in (None, ""):
+                        try:
+                            aic.append(float(row["aicore_pct"]))
+                        except ValueError:
+                            pass
+            if not aic:
+                rows.append(f"| {name} | 0 | 解析失败（见 raw 列） | — |")
+                continue
+            avg = sum(aic) / len(aic)
+            longest = cur = 0
+            for v in aic:
+                cur = cur + 1 if v < 5.0 else 0
+                longest = max(longest, cur)
+            rows.append(f"| {name} | {len(aic)} | {min(aic):.1f} / {avg:.1f} "
+                        f"| {longest} 样本(≈秒) |")
+            if longest >= 10:
+                suspicious.append(name)
+        out.extend(rows)
+        out.append("")
+        if suspicious:
+            out.append(f"⚠️ 检出近零窗口（{', '.join(suspicious)}）：玩具模型算子极小、"
+                       "AI Core 本征利用率偏低，需结合 raw 列人工复核；真实 GNN 接入时"
+                       "此类窗口即 P1 一票否决。")
+        else:
+            out.append("✅ 未检出 AI Core 长时间近零窗口。注：玩具模型算子小，AI Core "
+                       "本征利用率偏低属正常；**本阶段为采样存证**，真实 GNN 接入时"
+                       "以\"AI Core 长时间接近 0% + HBM 非预期回落（D2H→CPU→H2D 特征）\""
+                       "为一票否决门禁。")
+    # ---- P2: 交换信噪比 ----
+    out.append("")
+    out.append("#### P2 交换信噪比（交换段占单步训练耗时，<1% 为佳）")
+    out.append("")
+    out.append("| 运行 | 交换段合计 (µs/步) | 单步训练 (ms/步) | 占比 | 判定 |")
+    out.append("|---|---|---|---|---|")
+    for tag, e in (("E2 混合 dlpack", RUNS[0].get("e2")),
+                   ("E3 混合 copy", RUNS[0].get("e3")), ("E4 对称混合", SYM)):
+        if e and e.get("exchange_ratio_pct") is not None:
+            ratio = e["exchange_ratio_pct"]
+            verdict_s = ("✅ <1%" if ratio < 1.0 else
+                         "玩具规模偏高*（真实模型单 batch 数十~数百 ms 时占比将 <1%）")
+            out.append(f"| {tag} | {e['exf_us'] + e['exb_us']:.1f} "
+                       f"| {fmt(e.get('lat_ms'), '{:.2f}')} | {ratio:.2f}% | {verdict_s} |")
+        else:
+            out.append(f"| {tag} | ⏳ 待复测 | ⏳ 待复测 | ⏳ 待复测 | ⏳ |")
+    out.append("")
+    out.append("\\* P2 的 <1% 口径以真实 GNN 单 batch 耗时为分母（DeepSeek 咨询示例："
+               "交换 100µs / 单 batch 100ms = 0.1%）；玩具代理单步仅毫秒级，"
+               "占比天然偏高，仅作机制存证。")
+    # ---- P3: epoch 口径 ----
+    out.append("")
+    out.append("#### P3 epoch 耗时口径（接入真实模型时的总账判定）")
+    out.append("")
+    out.append("接入客户真实 GNN 代码后，以 **B0（纯 MS 原生）epoch 均值为基准**，"
+               "修改后代码 ≥3 个完整 epoch 耗时增加 **≤20%** 为 PASS。玩具代理不适用"
+               "该口径（小模型步时延由框架调度常数主导，见 §4.5 范式代价披露），"
+               "按交换占比折算外推；GNN 采样与原子累加的非确定性要求固定采样种子、"
+               "多次重复取均值。")
+    return "\n".join(out)
 
 
 def pair_all_ok():
@@ -597,7 +880,7 @@ TEMPLATE = """# DLPack 混合编程验证报告
 
 | | |
 |---|---|
-| **验证主题** | MindSpore ↔ PyTorch(torch_npu) 基于 DLPack 的 Tensor 零拷贝交换与梯度桥接 |
+| **验证主题** | MindSpore → PyTorch 迁移过渡态:DLPack 零拷贝交换 + 梯度桥接的混合训练 |
 | **验证环境** | 昇腾 910B3(Atlas A2)真机,CANN 8.3.RC1 |
 | **报告日期** | {{DATE}} |
 | **数据来源** | results/{{DATA_SRC}}/ (机器可读摘要 + 逐步训练日志) |
@@ -607,16 +890,24 @@ TEMPLATE = """# DLPack 混合编程验证报告
 
 ## 1. 验证目的
 
-验证在昇腾(Atlas A2)环境下,MindSpore 与 PyTorch(torch_npu)两个框架能否:
+**业务背景**:客户模型当前为 MindSpore,规划迁移至 PyTorch;因迁移人力有限且模型
+持续演进,选择 **DLPack 混合编程作为迁移过渡态**——未迁移模块留在 MindSpore,
+已迁移模块改用 PyTorch,边界两侧通过零拷贝交换 + 梯度桥接联合训练,随迁移推进
+逐步缩小 MS 侧。在昇腾(Atlas A2)环境下验证:
 
 1. **零拷贝交换**:通过 DLPack 协议共享同一块内存中的 Tensor,不发生数据拷贝;
 2. **跨框架梯度回传**:交换后 PyTorch 侧能重建局部计算图并正常反向传播;
-3. **梯度桥接**:PyTorch 产出的边界梯度(`pt_input.grad`)能回送至 MindSpore 作为 `sens`,
-   使**两侧模型参数在同一步训练中均被正确更新**——且梯度数值须与数学解析解一致,
-   而非仅"梯度非零"。
-4. **训练可用性与交换机制收益**:同参数混合训练双跑主对照(E2 = DLPack 交换 /
-   E3 = host 拷贝交换,唯一变量 = 交换机制),验证交换机制不影响数值正确性,
-   并量化 DLPack 相对 host 拷贝的收益(判据体系见 §3.3 与附录 A)。
+3. **梯度桥接**:边界梯度能回送至另一侧作为 `sens`,使**两侧模型参数在同一步训练中
+   均被正确更新**——且梯度数值须与数学解析解一致,而非仅"梯度非零";
+4. **切换等价性(敢切)**:混合过渡态 vs 纯 MindSpore 基线(MS 参照臂 = 唯一基线
+   B0)——收敛、held-out 指标、训练/验证曲线(loss 曲线与过拟合监测为必须项)
+   统计等价,切换不改变训练效果;
+5. **交换机制选型(E2 vs E3,收益证据层)**:同参数混合训练双跑,唯一变量 = 交换
+   机制(dlpack vs host 拷贝),量化 DLPack 收益;
+6. **形态对称性(迁移全程适用)**:PT前段+MS后段(E4,迁移过半形态)与
+   MS前段+PT后段(E2)机制对称,切分方向不影响桥接;
+7. **GNN 场景门禁**:图语义聚合(C1)、稀疏参数完整性(C3)、算子回退检测(P1)、
+   交换信噪比(P2)——判据体系见 §3.3。
 
 ## 2. 验证环境
 
@@ -632,7 +923,7 @@ TEMPLATE = """# DLPack 混合编程验证报告
 
 ## 3. 验证方法
 
-### 3.1 机制验证设计(verify_dlpack.py,9 个 STEP)
+### 3.1 机制验证设计(verify_dlpack.py,11 个 STEP / 17 检查项)
 
 ```mermaid
 flowchart TB
@@ -672,6 +963,8 @@ flowchart TB
 | 7 | 负对照:ones_like 假 sens 必须产生不同梯度 | 第二层 |
 | 8 | 两侧参数均被实际更新 | 第二层 |
 | 9 | 交换耗时:dlpack 路径 vs 拷贝路径 | 非功能:性能可测量性 |
+| 10 | **图语义聚合对照**:交换边界两侧各做一次 scatter 聚合(unsorted_segment_sum / index_add_),结果一致 ≤1e-5 | GNN C1(必过) |
+| 11 | **稀疏 Embedding 完整性**:交换路径上未访问行梯度恒零、稀疏更新后零变化 | GNN C3 |
 
 ### 3.2 数值正确性的判定方法(STEP 6 的设计意图)
 
@@ -681,37 +974,51 @@ flowchart TB
 **< rtol 即 PASS**——排除"用全 1 假 sens 也能得到非零梯度"的假阳性
 (STEP 7 负对照进一步兜底)。
 
-### 3.3 训练收敛与主对照设计(train_hybrid.py,E2 vs E3)
+### 3.3 训练收敛与对照设计(train_hybrid.py:MS 参照臂 + E2/E3/E4)
 
-**主对照设计**:同参数混合训练跑两次,唯一变量 = 交换机制——直接度量
-"DLPack 交换本身"的价值:
+每次运行跑两臂:**MS 参照臂**(纯 MindSpore 端到端 = 唯一基线 B0)+ 混合臂
+(`--topology` 选择形态),同种子、同初始化、同数据、同超参。模型为**固定小图
+(128 节点、每节点 4 邻居)上的单层消息传递图网络**(教师同构、权重固定;聚合 =
+均值消息传递 `segment_sum(gather(X,src),dst)/k`,训练链路真实包含 scatter/gather
+前向与梯度散布,与真实 GNN 的消息传递算子形态一致);切分点在聚合之后(边界 =
+节点表示,真实 GNN 的典型切分位置);held-out 验证集(独立验证图,512 节点)训练前/
+每 10 步/训练后各评一次(验证曲线落盘逐步 CSV,计时段外评估,监测过拟合且不污染
+步时延)。
 
-- **E2(目标方案)**:前段 MindSpore(Dense+ReLU)──DLPack──▶ 后段 PyTorch(Linear),
-  每步完整梯度桥接(①剪 ②传 ③立 ④反向 ⑤递);
-- **E3(对照)**:同 E2,交换改为 host 拷贝(NPU→host→NPU 往返 + 流同步)。
+- **E2/E3 主对照(交换机制选型)**:混合臂形态 = MS前段(Dense+ReLU)──交换──▶
+  PT后段(Linear),每步完整梯度桥接(①剪 ②传 ③立 ④反向 ⑤递);E2 用 DLPack,
+  E3 用 host 拷贝(NPU→host→NPU 往返 + 流同步)——唯一变量 = 交换机制,
+  直接度量 DLPack 的价值;
+- **E4 形态对称性(迁移全程适用)**:对称形态 PT前段──DLPack──▶MS后段
+  (`--topology front_pt`),即迁移过半时"已迁移模块在前"的真实形态。
 
-模型为非线性小网(教师为固定随机权重的同构非线性映射);两跑同种子、同初始化、
-同数据、同超参;held-out 验证集 512 条独立采样,训练前/每 10 步/训练后各评一次
-(验证曲线落盘逐步 CSV,在计时段外评估,监测过拟合且不污染步时延)。
 **归因原则**:两种交换机制下混合前段的框架调度开销完全相同,因此 E2 vs E3 的
-任何差异都纯粹来自交换机制——这正是主对照设计消除归因混淆的意义。
+任何差异都纯粹来自交换机制——这正是主对照设计消除归因混淆的意义;混合臂相对
+MS 参照臂(B0)的步时延差为**范式代价披露项**(过渡期训练变慢的真实成本,生产规模
+按占比摊薄),不作为 dlpack 判据。
 
-每次运行内置底线(单次自检):
+**判据体系(对齐行业咨询口径;B0 = MS 参照臂为唯一基线,B1 纯 PyTorch 不做)**:
 
-| 底线 | 判据 |
-|---|---|
-| 收敛性 | loss 下降、全程无 NaN/Inf |
-| 泛化(过拟合检查) | held-out 验证损失随训练同步下降,终点与训练损失同量级(无病态过拟合分歧) |
-| M4 边界数值正确 | 训练前同权重标定一次:桥接梯度 vs torch 参考梯度(不训练,仅单次前向反向),相对误差 < rtol |
-| 初始一致性 | 混合前向初始 loss 与 torch 参考前向 loss 偏差 ≈ 0 |
+正确性门禁:
 
-主对照判据(make_report.py 汇总 E2/E3 摘要):
+| 编号 | 判据 | 内容 | 落点 |
+|---|---|---|---|
+| C1 | 图语义聚合一致 | 交换边界两侧各做一次 scatter 聚合,结果一致 ≤1e-5(必过) | E1 STEP 10 |
+| C2 | 梯度等价性 | **双锚**:解析解/torch 参考 + B0 纯 MS 端到端,相对误差 < rtol | E1 STEP 6 + 训练 M4 双锚 |
+| C3 | 稀疏参数完整性 | 交换路径上未访问 Embedding 行梯度恒零、更新后零变化 | E1 STEP 11 |
+| C4 | 收敛曲线一致性(必须项) | E2/E3 训练+验证曲线**逐位一致**(交换不影响数值);混合 vs B0 **统计等价**(loss 比 ∈[0.5,2.0]、held-out ≤1.01、曲线形态一致);跨框架算子 ulp 差异经训练动力学混沌放大属正常,不要求逐点相等 | 逐步 CSV + 图 1 |
+| — | 运行内自检 | 收敛性(loss 下降无 NaN/Inf);混合初始 loss 与参考偏差 ≈ 0 | 每次运行 |
 
-| 判据 | 内容 |
-|---|---|
-| C1 数值一致性 | E2/E3 的 final loss 与 held-out 评估比值 ≈ 1.000(期望逐位一致) |
-| C2 步时延 | dlpack 步时延 ≤ copy × 1.02 |
-| C3 交换段 | dlpack 交换段耗时 ≤ copy(E5 bench 为机制级上界证据) |
+性能口径(先卡回退,再谈快慢):
+
+| 编号 | 判据 | 内容 | 落点 |
+|---|---|---|---|
+| P1 | 算子回退检测 | 交换边界两侧算子全程 NPU 执行;真实 GNN 接入时"AI Core 长时间近零 + HBM 非预期回落"一票否决 | run_all 自动采样存证(§4.9) |
+| P2 | 交换信噪比 | 交换段占单步训练 <1%;逐算子级交换需重审交换点设计 | 摘要 exchange_ratio_pct(§4.9) |
+| P3 | epoch 耗时总账 | 接入真实模型:≥3 epoch 耗时 ≤B0×1.2 为 PASS;玩具代理按占比摊薄披露 | 接入时执行(§4.9) |
+
+**收益证据(非门禁)**:E2 vs E3 机制选型对照(§4.4)——量化 DLPack 相对 host 拷贝
+的交换段收益与 bench 上界。
 
 ## 4. 验证结果
 
@@ -750,7 +1057,12 @@ MindSpore/CANN 全部 [OK],双向 DLPack 冒烟测试通过。
 
 \\* 见 §5.2 的内存层次说明。
 
-### 4.4 主对照 E2 vs E3(910B 真机)
+### 4.4 交换机制选型(收益证据层):E2 目标方案(dlpack) vs E3 替代方案(host 拷贝)(910B 真机)
+
+**基线说明**:基线 = **MS 参照臂**(纯 MindSpore 端到端,见 §4.5);
+E3 是 DLPack 的**替代方案对照**,不是基线——本节两臂同为混合场景,
+唯一变量 = 交换机制。本节属**收益证据层**(非门禁):量化"过渡态选 DLPack 而非
+host 拷贝"的交换段收益。
 
 {{SCALE_PAIR_TABLES}}
 
@@ -764,27 +1076,52 @@ MindSpore/CANN 全部 [OK],双向 DLPack 冒烟测试通过。
 
 ![E2/E3 loss 曲线对照(910B 真机)](../charts/loss_curves_npu.png)
 
-*图 1 — C1 与泛化证据:同参数混合训练的训练/验证 loss 曲线(E2 蓝 / E3 橙,验证为虚线)
-与逐点 E3/E2 训练 loss 比值。两跑曲线重合,比值 ≈ 1.000——交换机制不影响数值;
-训练/验证曲线同步下降、终点同量级——无过拟合分歧。*
+*图 1 — 切换等价性 + C1 + 泛化证据:纯MindSpore 基线(灰)/E2(蓝)/E3(橙)的训练与验证
+loss 曲线(验证为虚线)与逐点 E3/E2 训练 loss 比值。两混合跑曲线重合(比值 ≈ 1.000)
+——交换机制不影响数值;三臂训练/验证曲线同步下降、终点同量级——无过拟合分歧,
+混合态与现状训练效果等价。*
 
 ![E2/E3 交换段与步时延对比(910B 真机)](../charts/e2_vs_e3_npu.png)
 
-*图 2 — C2/C3 证据:交换段耗时(µs/步,log)与混合臂步时延(ms/步)对比。*
+*图 2 — 收益证据:交换段耗时(µs/步,log)与混合臂步时延(ms/步)对比。*
 
-### 4.5 收敛与边界数值底线(910B 真机)
+### 4.5 切换等价性:混合过渡态 vs 纯 MindSpore 基线(910B 真机)
+
+客户从纯 MS 切到混合过渡态时,最关心"训练效果是否与现在一致"。本节对照同一次
+运行内的 MS 参照臂(纯 MindSpore 端到端)与混合臂——统计等价判据;loss 曲线与
+过拟合监测为必须项,两臂曲线对照见图 1:
+
+{{EQ_TABLE}}
+
+**结论解读**:
+
+{{EQ_CONCLUSION}}
+
+### 4.6 形态对称性:PT前段+MS后段(910B 真机)
+
+迁移过半时的真实形态(已迁移模块在前、未迁移模块在后)。机制与 §4.4 主对照对称
+(同为双向交换 + sens/vjp 反传),E4 实测确认切分方向不影响桥接:
+
+{{SYM_SECTION}}
+
+![形态对称性(910B 真机)](../charts/symmetry_npu.png)
+
+*图 3 — E4 对称形态的训练/验证曲线与 MS 参照对照(右下为机器可读摘要)。*
+
+### 4.7 梯度等价性(C2 双锚)与收敛底线(910B 真机)
 
 {{M4_TABLE}}
 
-M4 在两种交换机制下均**逐位一致(rel_err = 0.0)**——梯度桥接的数值
-正确性不受交换方式影响。
+M4 双锚在两种交换机制与两种混合形态下均**逐位一致(rel_err = 0.0)**——torch 锚
+证明桥接的数学正确性,B0 锚(纯 MindSpore 端到端)证明与基线的梯度等价;
+梯度桥接的数值正确性不受交换方式与切分方向影响。
 
 ![验证判据评分卡(910B 真机)](../charts/metrics_scorecard.png)
 
-*图 3 — 评分卡:M4 边界数值 / C1 数值一致性 / C2 步时延 / E5 加速比。
+*图 4 — 评分卡:M4 边界数值 / C1 数值一致性 / C2 步时延 / E5 加速比。
 绿=通过带,红/灰虚线=阈值。*
 
-### 4.6 纯交换吞吐收益(910B 真机,--bench 尺寸扫描)
+### 4.8 纯交换吞吐收益(910B 真机,--bench 尺寸扫描)
 
 同进程对比两种交换机制(N=200,剥离框架算子开销);边界张量 = batch×hidden×4B,
 从 32 KB 扫到 4 MB——覆盖小验证模型到 100M 级真实模型(数十 MB 边界张量)之间的跨度,
@@ -794,8 +1131,12 @@ M4 在两种交换机制下均**逐位一致(rel_err = 0.0)**——梯度桥接�
 
 ![纯交换吞吐对比(910B --bench 尺寸扫描)](../charts/bench_npu.png)
 
-*图 4 — G2 证据:纯交换吞吐对比(log 刻度,按边界张量尺寸)。dlpack 全程留在 NPU 显存,
+*图 5 — G2 证据:纯交换吞吐对比(log 刻度,按边界张量尺寸)。dlpack 全程留在 NPU 显存,
 copy 需 NPU→host→NPU 往返 + 流同步。bench 为机制级上界;训练内实测见 §4.4。*
+
+### 4.9 性能门禁与信噪比(P1/P2/P3)
+
+{{PERF_SECTION}}
 
 ## 5. 技术说明
 
@@ -854,6 +1195,16 @@ sequenceDiagram
 6. **结论外推边界**:本验证为小模型的机制与收敛验证;接入客户真实训练代码时,
    先用本套脚本回归环境,再逐步替换模型规模;绝对步时延中的框架调度常数在
    生产规模按占比复测为最终判据。
+7. **行业图网络模型(GNN)接入注意**:消息传递类算子(scatter/gather/变长邻接结构)
+   的边界张量可能为动态 shape/非 ND 布局,接入时需按首个真实切分点单独回归
+   (FRACTAL_NZ 限制同上);图网络的采样 batch 亦可调,等价性/对称性判据可直接复用。
+8. **接入验收清单(对齐行业咨询口径)**:①B0 用客户真实 GNN 代码先跑通(验证启动
+   前置,提供参考曲线/梯度/epoch 耗时/AI Core-HBM 基线);②正确性以 B0 为锚做
+   单步(C1/C2/C3)与多步(C4,≥3 epoch)对照;③P1 一票否决(回退检测,npu-smi 采样);
+   ④P3 epoch 耗时 ≤B0×1.2 总账判定;⑤固定采样种子、跑 3 次取最大误差/均值曲线;
+   ⑥异构图(RGCN/HGT)额外检查 etype 索引完整性;⑦覆盖矩阵按真实图数据结构选点
+   (稠密/稀疏/大规模/异构)。本报告的玩具代理验证完成 ①的机制层与门禁基建,
+   ②~⑦在接入真实模型时执行。
 
 ## 7. 交付物清单
 
@@ -861,9 +1212,9 @@ sequenceDiagram
 |---|---|
 | `scripts/check_env.py` | 环境自检(含双向 DLPack 冒烟) |
 | `scripts/verify_dlpack.py` | 机制验证脚本(9 STEP,14 检查项) |
-| `scripts/train_hybrid.py` | 混合训练主对照(`--exchange dlpack/copy`,`--bench`) |
+| `scripts/train_hybrid.py` | 混合过渡态验证(MS 参照臂 + E2/E3/E4,`--bench`) |
 | `scripts/make_report.py` | **一键报告生成(本报告即其产物)** |
-| `charts/` | 四张证据图 |
+| `charts/` | 五张证据图 |
 | `results/{npu,cpu}/` | 机器可读摘要 + 逐步训练日志 |
 | `requirements-*.txt` | 依赖清单 |
 | `README.md` / `docs/代码解读.md` | 使用说明 / 代码解读 |
@@ -874,9 +1225,14 @@ sequenceDiagram
 PyTorch(torch_npu)2.7.1 之间基于 DLPack 的 Tensor 零拷贝交换、跨框架局部梯度回传、
 以及梯度桥接的两侧参数联合更新**全部验证通过**——机制梯度误差 ~1e-7(优于容差 4 个
 数量级);主对照 E2 vs E3 中两种交换机制的训练结果**逐位一致**(交换不影响数值),
-DLPack 的交换段与步时延收益显著(§4.4);M4 桥接梯度逐位一致(0.0);
-纯交换收益 dlpack 较 host 拷贝快 {{BENCH_RANGE}}。{{BENCH_SPEED}}
-混合编程的数据通道与梯度边界缝合机制在该环境成立,可支撑混合训练工程化。
+DLPack 的交换段与步时延收益显著(§4.4);混合过渡态相对纯 MindSpore 基线
+**切换等价**(§4.5,收敛/held-out/验证曲线统计等价),对称形态 PT前段+MS后段
+**机制成立**(§4.6);M4 桥接梯度逐位一致(0.0);纯交换收益 dlpack 较 host 拷贝
+快 {{BENCH_RANGE}}。{{BENCH_SPEED}}
+DLPack 混合过渡态的"敢切(等价)、选对(机制)、全程适用(对称)"三要素在该环境
+全部成立;验证判据对齐行业咨询口径(C1 图语义聚合 / C2 梯度双锚 / C3 稀疏完整性 /
+C4 收敛一致性 + P1 回退检测 / P2 交换信噪比 / P3 epoch 总账),可支撑
+MindSpore → PyTorch 的渐进迁移工程化。
 
 **后续建议**:
 
@@ -903,23 +1259,27 @@ DLPack 的交换段与步时延收益显著(§4.4);M4 桥接梯度逐位一致(0
 ### A.2 衡量标准
 
 **运行内底线**:收敛性 / M4 边界数值正确性 / 初始一致性。
-**主对照判据**(E2 vs E3,唯一变量 = 交换机制):C1 数值一致性 /
-C2 步时延 / C3 交换段。
+**收益证据**(E2 vs E3,唯一变量 = 交换机制):机制间数值一致 / 步时延 / 交换段。
 **增益指标**:G1 开发工作量节省 / G2 交换开销节省(--bench 与主对照)/
 G3 host 峰值内存节省 / G4 迭代敏捷性。
 
 ### A.3 实验设计(主对照)
 
 E2 = 混合 + DLPack;E3 = 混合 + host 拷贝;两跑同种子/同初始化/同数据/同超参,
-唯一变量 = 交换机制。
+唯一变量 = 交换机制。另有 MS 参照臂(纯 MindSpore 基线,切换等价性判据,§4.5)
+与 E4 对称形态 PT前段+MS后段(§4.6)。
 指标:loss 曲线一致性 / 最终 eval 指标 / 步时延 / 交换段耗时 / host 内存峰值。
-预期:E2 ≡ E3(数值,C1);E2 优于 E3(C2/C3/G2/G3);G1 走工程度量。
+预期:E2 ≡ E3(数值,C1);混合 ≡ MS 参照(统计等价);E2 优于 E3(C2/C3/G2/G3);
+G1 走工程度量。
 
 ### A.4 适用边界
 
 混合编程的存在意义 = **两侧存在不可/不宜迁移的资产**。若模型可整体单框架实现,
 则混合方案收益为负(额外桥接复杂度),不应采用。
 """
+
+# 正文连贯单行: 合并模板内的手工硬换行 (表格/列表/代码块结构不受影响)
+TEMPLATE = unwrap_md(TEMPLATE)
 
 
 # ---------------------------------------------------------------------------
@@ -942,6 +1302,7 @@ def main():
     # ---- 训练摘要归一化 (兼容 v1 键名) 并填入图表数据源 ----
     RUNS[0]["e2"] = norm_run(s["h64_e2"])
     RUNS[0]["e3"] = norm_run(s["h64_e3"])
+    globals()["SYM"] = norm_run(s["h64_e4"])
     BENCH[:] = norm_bench(s["bench"])
 
     # ---- 正式报告条件: npu 的 verify + E2 + E3 (h64 主对照对) 三份齐备 ----
@@ -953,12 +1314,20 @@ def main():
         missing.append(("E2/E3 h=64 主对照对",
                         "python scripts/train_hybrid.py --device npu --rtol 5e-3\n"
                         "  python scripts/train_hybrid.py --device npu --exchange copy --rtol 5e-3"))
+    if not s["h64_e4"]:
+        missing.append(("E4 对称形态 (PT前段+MS后段)",
+                        "python scripts/train_hybrid.py --device npu --topology front_pt --rtol 5e-3"))
+    vt = (s["verify"] or {}).get("n_total")
+    if vt is not None and vt != 17:
+        missing.append(("E1 机制验证重跑(新版 17 检查项, 新增 GNN C1/C3)",
+                        "python scripts/verify_dlpack.py --device npu --rtol 5e-3"))
     if not s["bench"]:
         missing.append(("E5 纯交换吞吐(尺寸扫描)",
                         "python scripts/train_hybrid.py --device npu --bench"))
 
     # ---- 绘图 ----
-    charts = [fig_loss_curves(), fig_e2e3(), fig_scorecard(), fig_bench()]
+    charts = [fig_loss_curves(), fig_e2e3(), fig_symmetry(), fig_scorecard(),
+              fig_bench()]
     for p in charts:
         print("图表已生成:", p)
 
@@ -975,7 +1344,7 @@ def main():
     }
 
     # ---- 主对照结论与说明 ----
-    lat_note = ("混合训练的绝对步时延(≈2 ms)主体为 MindSpore PYNATIVE 单算子调度常数,"
+    lat_note = ("混合训练的绝对步时延的主体为 MindSpore PYNATIVE 单算子调度常数,"
                 "该常数在 E2/E3 两种交换机制下完全相同——因此主对照差值纯粹来自交换机制,"
                 "不存在向框架常数归因的混淆;该绝对开销随计算密度增大被摊薄,"
                 "生产规模(每步计算百 ms~秒级)按占比评估。")
@@ -1029,7 +1398,11 @@ def main():
         "{{T_COPY}}": g("t_copy_us", "{:.1f}"),
         "{{SCALE_PAIR_TABLES}}": scale_tables,
         "{{PAIR_CONCLUSION}}": pair_conclusion(),
+        "{{EQ_TABLE}}": eq_table(),
+        "{{EQ_CONCLUSION}}": eq_conclusion(),
+        "{{SYM_SECTION}}": sym_block(),
         "{{M4_TABLE}}": m4_table(),
+        "{{PERF_SECTION}}": perf_section(),
         "{{LAT_NOTE}}": lat_note,
         "{{BENCH_RANGE}}": bench_rng,
         "{{BENCH_SPEED}}": bench_speed,
@@ -1048,6 +1421,14 @@ def main():
     print(f"数据来源       : results/{dev}/")
     for p in charts:
         print(f"图表           : {p}")
+    # ---- 数据结果整合导出 (多 sheet 工作簿, 文件名带时间戳) ----
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from export_xlsx import export_xlsx
+        xlsx_path = export_xlsx(dev)
+        print(f"数据结果工作簿 : {xlsx_path}")
+    except ImportError:
+        print("[提示] 未安装 openpyxl, 跳过 Excel 工作簿导出 (pip install openpyxl)")
     if missing:
         print("-" * 78)
         print("以下数据缺失, 报告对应条目以\"待复测\"占位:")

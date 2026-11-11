@@ -13,3 +13,5 @@ numpy==1.26.4        # must stay <2.0: mindspore 2.11 declares numpy>=1.25 but i
 torch==2.5.1         # PyPI Windows wheel is the CPU build
 mindspore==2.11.0    # last-but-one Windows wheel line (2.7.0+ publish Windows again);
                      # chosen to stay close to the 910B target (customer uses 2.10.0)
+matplotlib           # report charts (make_report.py)
+openpyxl             # multi-sheet results workbook (export_xlsx.py)

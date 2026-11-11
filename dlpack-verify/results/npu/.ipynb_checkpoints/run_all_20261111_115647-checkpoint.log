@@ -1,0 +1,476 @@
+
+##############################################################################
+### [1/6] E0 — 环境自检 (torch_npu/NPU/CANN/双向 DLPack 冒烟)
+### cmd: /home/mindspore/work/.venv/bin/python /home/mindspore/work/scripts/check_env.py 
+##############################################################################
+==============================================================================
+DLPack 验证环境自检
+==============================================================================
+------------------------------------------------------------------------------
+冒烟测试 (smoke test):
+  [OK]  MindSpore -> to_dlpack  capsule 导出成功: <class 'PyCapsule'>
+  [OK]  MindSpore -> PyTorch  from_dlpack 成功: shape=(2, 3), device=cpu, dtype=torch.float32
+  [OK]  PyTorch -> MindSpore from_dlpack 成功: shape=(2, 3), dtype=Float32
+==============================================================================
+[OK]   Python                       3.10.21
+[OK]   平台                           Linux-5.10.0-60.18.0.50.r865_35.hce2.aarch64-aarch64-with-glibc2.38
+[OK]   numpy                        1.26.4
+[OK]   PyTorch                      2.7.1+cpu
+[OK]   torch_npu                    2.7.1  NPU设备数=1
+[OK]   MindSpore                    2.10.0
+[OK]   mindspore.utils.dlpack       to_dlpack=True, from_dlpack=True
+[OK]   torch.utils.dlpack           to_dlpack/from_dlpack 均存在
+[OK]   CANN/npu-smi                 +-----------------------------------------------------------
+==============================================================================
+结论: 环境齐备, 可以开始 DLPack 验证。(标注 [OPT] 的项为当前平台可选)
+### [E0] 退出码 0  耗时 21.0 s
+
+##############################################################################
+### [2/6] E1 — 机制验证: 9 STEP / 14 检查项 (零拷贝/桥接/解析解/负对照)
+### cmd: /home/mindspore/work/.venv/bin/python /home/mindspore/work/scripts/verify_dlpack.py --device npu --rtol 5e-3
+##############################################################################
+==============================================================================
+DLPack 验证  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  mode=PYNATIVE
+==============================================================================
+
+--- STEP 1/2: 双向基础交换 (dtype/shape/设备) ---
+  [PASS] STEP 1  MS→PT 交换  -- shape=(2, 2) dtype=torch.float32 device=cpu
+  [PASS] STEP 2  PT→MS 交换  -- shape=(2, 2) dtype=Float32
+
+--- STEP 3: 零拷贝语义验证 ---
+  [PASS] STEP 3  MS→PT 零拷贝 (torch.fill_ 后 MS 侧同步)  -- MS 侧读回=[[7.0, 7.0], [7.0, 7.0]]
+  [PASS] STEP 3  PT→MS 零拷贝 (torch.add_ 后 MS 侧同步)  -- MS 侧读回=[[4.0, 4.0], [4.0, 4.0]]
+
+--- STEP 4: PyTorch 局部计算图 (DLPack 叶子重建) ---
+  [PASS] STEP 4  pt_input.grad 非空  -- grad shape=(1, 4)
+  [PASS] STEP 4  pt_head 参数梯度非空
+
+--- STEP 5: 梯度桥接 (pt_input.grad → MS sens) ---
+  [PASS] STEP 5  MS 参数梯度非空 (sens_param=True)  -- fc.weight:(4, 4) | fc.bias:(4,)
+
+--- STEP 6: 数值正确性 (float64 解析解对照) ---
+  [PASS] STEP 6  两框架前向 loss 一致  -- torch=0.22105893 vs 解析=0.22105896
+  [PASS] STEP 6  pt_input.grad == 解析解 d(loss)/d(ms_out)  -- rel_err=6.970e-08
+  [PASS] STEP 6  MS weight 梯度 == 解析解 d(loss)/dW1  -- rel_err=1.423e-07
+  [PASS] STEP 6  MS bias 梯度 == 解析解 d(loss)/db1  -- rel_err=6.970e-08
+
+--- STEP 7: 负对照 (ones_like 假 sens 应产生不同梯度) ---
+  [PASS] STEP 7  假 sens 梯度 ≠ 真实桥接梯度  -- max|ΔW|=1.515e+00
+
+--- STEP 8: 两侧参数更新 ---
+  [PASS] STEP 8  PyTorch 参数已更新  -- max|Δw|=1.120e-04
+  [PASS] STEP 8  MindSpore 参数已更新  -- max|Δw|=4.030e-03
+
+--- STEP 9: 交换耗时统计 (100 次均值) ---
+  dlpack 交换:     16.0 us/次   |  拷贝路径(asnumpy→torch):     32.1 us/次
+
+--- STEP 10: 图语义聚合对照 (边界 scatter 聚合, 两侧一致) ---
+  [PASS] STEP 10  交换边界 scatter 聚合两侧一致 (图语义 C1)  -- rel_err=0.000e+00
+
+--- STEP 11: 稀疏 Embedding 梯度完整性 (未访问行必须零变化) ---
+  [PASS] STEP 11  稀疏梯度完整性: 未访问行梯度恒为零  -- max|g|_untouched=0.000e+00
+  [PASS] STEP 11  稀疏更新后未访问行零变化  -- max|Δ|=0.000e+00
+
+==============================================================================
+验证报告
+==============================================================================
+  [PASS] STEP 1  MS→PT 交换   (shape=(2, 2) dtype=torch.float32 device=cpu)
+  [PASS] STEP 2  PT→MS 交换   (shape=(2, 2) dtype=Float32)
+  [PASS] STEP 3  MS→PT 零拷贝 (torch.fill_ 后 MS 侧同步)   (MS 侧读回=[[7.0, 7.0], [7.0, 7.0]])
+  [PASS] STEP 3  PT→MS 零拷贝 (torch.add_ 后 MS 侧同步)   (MS 侧读回=[[4.0, 4.0], [4.0, 4.0]])
+  [PASS] STEP 4  pt_input.grad 非空   (grad shape=(1, 4))
+  [PASS] STEP 4  pt_head 参数梯度非空
+  [PASS] STEP 5  MS 参数梯度非空 (sens_param=True)   (fc.weight:(4, 4) | fc.bias:(4,))
+  [PASS] STEP 6  两框架前向 loss 一致   (torch=0.22105893 vs 解析=0.22105896)
+  [PASS] STEP 6  pt_input.grad == 解析解 d(loss)/d(ms_out)   (rel_err=6.970e-08)
+  [PASS] STEP 6  MS weight 梯度 == 解析解 d(loss)/dW1   (rel_err=1.423e-07)
+  [PASS] STEP 6  MS bias 梯度 == 解析解 d(loss)/db1   (rel_err=6.970e-08)
+  [PASS] STEP 7  假 sens 梯度 ≠ 真实桥接梯度   (max|ΔW|=1.515e+00)
+  [PASS] STEP 8  PyTorch 参数已更新   (max|Δw|=1.120e-04)
+  [PASS] STEP 8  MindSpore 参数已更新   (max|Δw|=4.030e-03)
+  [PASS] STEP 10 交换边界 scatter 聚合两侧一致 (图语义 C1)   (rel_err=0.000e+00)
+  [PASS] STEP 11 稀疏梯度完整性: 未访问行梯度恒为零   (max|g|_untouched=0.000e+00)
+  [PASS] STEP 11 稀疏更新后未访问行零变化   (max|Δ|=0.000e+00)
+------------------------------------------------------------------------------
+合计: 17/17 PASS
+结论: 全部通过 — DLPack 交换/零拷贝/梯度桥接机制在该环境成立。
+机器可读摘要已写入: /home/mindspore/work/results/npu/verify_summary.json
+### [E1] 退出码 0  耗时 43.3 s
+
+##############################################################################
+### [3/6] E2 — 混合训练 dlpack + MS 参照臂 (收敛/泛化/切换等价性/M4, 逐步 CSV)
+### cmd: /home/mindspore/work/.venv/bin/python /home/mindspore/work/scripts/train_hybrid.py --device npu --steps 300 --hidden 64 --batch 128 --lr 0.05 --rtol 5e-3 --eval-every 10 --seed 7
+##############################################################################
+### [P1] npu-smi 回退检测采样已启动: /home/mindspore/work/results/npu/smi_E2_20261111_115751.csv
+==============================================================================
+混合训练主对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=64  batch=128  exchange=dlpack
+==============================================================================
+
+--- M4 边界梯度标定 (同权重单次对照, torch 参考模型不参与训练) ---
+  [M4] 边界梯度标定 (fc1 边界): 桥接梯度 vs torch 参考梯度  max_rel_err=2.805e-06 (rtol=0.005)  [PASS]
+  [M4] 双锚-B0/MS参照: 桥接梯度 vs 纯 MS 端到端梯度  max_rel_err=4.238e-06  [PASS]
+
+--- MS 参照臂: 纯 MindSpore 端到端 (300 步, 客户现状形态) ---
+  [验证] step     0  held-out MSE = 4.622830e-02
+  [MS参照] step     1  loss = 4.897690e-02
+  [验证] step    10  held-out MSE = 2.436276e-02
+  [验证] step    20  held-out MSE = 1.760315e-02
+  [验证] step    30  held-out MSE = 1.351836e-02
+  [验证] step    40  held-out MSE = 1.099903e-02
+  [验证] step    50  held-out MSE = 9.416742e-03
+  [MS参照] step    50  loss = 9.545813e-03
+  [验证] step    60  held-out MSE = 8.402415e-03
+  [验证] step    70  held-out MSE = 7.737707e-03
+  [验证] step    80  held-out MSE = 7.291695e-03
+  [验证] step    90  held-out MSE = 6.984656e-03
+  [验证] step   100  held-out MSE = 6.767374e-03
+  [MS参照] step   100  loss = 6.258956e-03
+  [验证] step   110  held-out MSE = 6.608689e-03
+  [验证] step   120  held-out MSE = 6.488748e-03
+  [验证] step   130  held-out MSE = 6.394550e-03
+  [验证] step   140  held-out MSE = 6.317510e-03
+  [验证] step   150  held-out MSE = 6.251875e-03
+  [MS参照] step   150  loss = 5.316732e-03
+  [验证] step   160  held-out MSE = 6.193738e-03
+  [验证] step   170  held-out MSE = 6.140555e-03
+  [验证] step   180  held-out MSE = 6.090521e-03
+  [验证] step   190  held-out MSE = 6.042334e-03
+  [验证] step   200  held-out MSE = 5.995316e-03
+  [MS参照] step   200  loss = 4.783728e-03
+  [验证] step   210  held-out MSE = 5.948659e-03
+  [验证] step   220  held-out MSE = 5.902222e-03
+  [验证] step   230  held-out MSE = 5.855820e-03
+  [验证] step   240  held-out MSE = 5.809370e-03
+  [验证] step   250  held-out MSE = 5.762857e-03
+  [MS参照] step   250  loss = 4.376777e-03
+  [验证] step   260  held-out MSE = 5.716333e-03
+  [验证] step   270  held-out MSE = 5.669809e-03
+  [验证] step   280  held-out MSE = 5.623278e-03
+  [验证] step   290  held-out MSE = 5.576811e-03
+  [验证] step   300  held-out MSE = 5.530398e-03
+  [MS参照] step   300  loss = 4.033311e-03
+
+--- 混合臂: MS前段 ──▶ PT后段 (300 步, exchange=dlpack) ---
+  [验证] step     0  held-out MSE = 4.622831e-02
+  [混合] step     1  loss = 4.897690e-02
+  [验证] step    10  held-out MSE = 2.354139e-02
+  [验证] step    20  held-out MSE = 1.712094e-02
+  [验证] step    30  held-out MSE = 1.322467e-02
+  [验证] step    40  held-out MSE = 1.081769e-02
+  [验证] step    50  held-out MSE = 9.302862e-03
+  [混合] step    50  loss = 9.414986e-03
+  [验证] step    60  held-out MSE = 8.329610e-03
+  [验证] step    70  held-out MSE = 7.690230e-03
+  [验证] step    80  held-out MSE = 7.260093e-03
+  [验证] step    90  held-out MSE = 6.963210e-03
+  [验证] step   100  held-out MSE = 6.752504e-03
+  [混合] step   100  loss = 6.234209e-03
+  [验证] step   110  held-out MSE = 6.598106e-03
+  [验证] step   120  held-out MSE = 6.480963e-03
+  [验证] step   130  held-out MSE = 6.388576e-03
+  [验证] step   140  held-out MSE = 6.312702e-03
+  [验证] step   150  held-out MSE = 6.247784e-03
+  [混合] step   150  loss = 5.306070e-03
+  [验证] step   160  held-out MSE = 6.190149e-03
+  [验证] step   170  held-out MSE = 6.137286e-03
+  [验证] step   180  held-out MSE = 6.087387e-03
+  [验证] step   190  held-out MSE = 6.039320e-03
+  [验证] step   200  held-out MSE = 5.992274e-03
+  [混合] step   200  loss = 4.776336e-03
+  [验证] step   210  held-out MSE = 5.945635e-03
+  [验证] step   220  held-out MSE = 5.899167e-03
+  [验证] step   230  held-out MSE = 5.852727e-03
+  [验证] step   240  held-out MSE = 5.806257e-03
+  [验证] step   250  held-out MSE = 5.759799e-03
+  [混合] step   250  loss = 4.370872e-03
+  [验证] step   260  held-out MSE = 5.713295e-03
+  [验证] step   270  held-out MSE = 5.666753e-03
+  [验证] step   280  held-out MSE = 5.620149e-03
+  [验证] step   290  held-out MSE = 5.573600e-03
+  [验证] step   300  held-out MSE = 5.527174e-03
+  [混合] step   300  loss = 4.028046e-03
+
+逐步训练日志已写入: /home/mindspore/work/scripts/../results/npu/training_log_dlpack_h64.csv
+
+==============================================================================
+混合过渡态报告 (topology=front_ms, exchange=dlpack) — 单次运行底线
+------------------------------------------------------------------------------
+  loss 曲线          : 4.898e-02 -> 4.028e-03  [PASS 收敛]
+  held-out 验证 MSE  : 4.622831e-02 -> 5.527174e-03  [PASS 泛化(无过拟合分歧)]
+  验证/训练终点比    : 1.37 (同量级即无病态过拟合)
+  MS 参照臂 loss     : 4.898e-02 -> 4.033e-03  [PASS 收敛]
+  切换等价性(混合/参照): loss 比 0.9987 (∈[0.5,2.0]) | held-out 比 0.9994 (≤1.01)  [PASS]
+  步时延(去预热)     : 混合 3.58 ms | MS参照 3.46 ms (范式代价披露, 非 dlpack 判据)
+  交换开销(含算子同步): 正向 53.7 us/步, 回传 52.7 us/步
+  交换信噪比(P2 口径) : 交换段占单步训练 2.98% (<1% 为佳)
+  [sanity] 初始 loss 一致性: |混合-参考|/参考 = 0.00e+00 (应 ≈ 0)
+  [PASS] M4 边界数值正确: 见上方标定输出
+------------------------------------------------------------------------------
+  说明: 数值一致性与耗时对照 (E2 vs E3) 由 scripts/make_report.py 汇总两份摘要生成。
+机器可读摘要已写入: /home/mindspore/work/results/npu/train_summary_h64_dlpack.json
+### [P1] 采样已停止, 数据: /home/mindspore/work/results/npu/smi_E2_20261111_115751.csv
+### [E2] 退出码 0  耗时 46.2 s
+
+##############################################################################
+### [4/6] E3 — 混合训练 copy 对照 + MS 参照臂 (唯一变量=交换机制)
+### cmd: /home/mindspore/work/.venv/bin/python /home/mindspore/work/scripts/train_hybrid.py --device npu --steps 300 --hidden 64 --batch 128 --lr 0.05 --rtol 5e-3 --eval-every 10 --seed 7 --exchange copy
+##############################################################################
+### [P1] npu-smi 回退检测采样已启动: /home/mindspore/work/results/npu/smi_E3_20261111_115837.csv
+==============================================================================
+混合训练主对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=64  batch=128  exchange=copy
+==============================================================================
+
+--- M4 边界梯度标定 (同权重单次对照, torch 参考模型不参与训练) ---
+  [M4] 边界梯度标定 (fc1 边界): 桥接梯度 vs torch 参考梯度  max_rel_err=3.145e-06 (rtol=0.005)  [PASS]
+  [M4] 双锚-B0/MS参照: 桥接梯度 vs 纯 MS 端到端梯度  max_rel_err=5.752e-06  [PASS]
+
+--- MS 参照臂: 纯 MindSpore 端到端 (300 步, 客户现状形态) ---
+  [验证] step     0  held-out MSE = 4.622830e-02
+  [MS参照] step     1  loss = 4.897690e-02
+  [验证] step    10  held-out MSE = 2.436276e-02
+  [验证] step    20  held-out MSE = 1.760315e-02
+  [验证] step    30  held-out MSE = 1.351836e-02
+  [验证] step    40  held-out MSE = 1.099903e-02
+  [验证] step    50  held-out MSE = 9.416742e-03
+  [MS参照] step    50  loss = 9.545812e-03
+  [验证] step    60  held-out MSE = 8.402415e-03
+  [验证] step    70  held-out MSE = 7.737707e-03
+  [验证] step    80  held-out MSE = 7.291695e-03
+  [验证] step    90  held-out MSE = 6.984655e-03
+  [验证] step   100  held-out MSE = 6.767374e-03
+  [MS参照] step   100  loss = 6.258955e-03
+  [验证] step   110  held-out MSE = 6.608689e-03
+  [验证] step   120  held-out MSE = 6.488748e-03
+  [验证] step   130  held-out MSE = 6.394550e-03
+  [验证] step   140  held-out MSE = 6.317510e-03
+  [验证] step   150  held-out MSE = 6.251876e-03
+  [MS参照] step   150  loss = 5.316732e-03
+  [验证] step   160  held-out MSE = 6.193738e-03
+  [验证] step   170  held-out MSE = 6.140556e-03
+  [验证] step   180  held-out MSE = 6.090521e-03
+  [验证] step   190  held-out MSE = 6.042335e-03
+  [验证] step   200  held-out MSE = 5.995316e-03
+  [MS参照] step   200  loss = 4.783728e-03
+  [验证] step   210  held-out MSE = 5.948659e-03
+  [验证] step   220  held-out MSE = 5.902222e-03
+  [验证] step   230  held-out MSE = 5.855820e-03
+  [验证] step   240  held-out MSE = 5.809370e-03
+  [验证] step   250  held-out MSE = 5.762857e-03
+  [MS参照] step   250  loss = 4.376776e-03
+  [验证] step   260  held-out MSE = 5.716332e-03
+  [验证] step   270  held-out MSE = 5.669809e-03
+  [验证] step   280  held-out MSE = 5.623278e-03
+  [验证] step   290  held-out MSE = 5.576811e-03
+  [验证] step   300  held-out MSE = 5.530398e-03
+  [MS参照] step   300  loss = 4.033310e-03
+
+--- 混合臂: MS前段 ──▶ PT后段 (300 步, exchange=copy) ---
+  [验证] step     0  held-out MSE = 4.622831e-02
+  [混合] step     1  loss = 4.897690e-02
+  [验证] step    10  held-out MSE = 2.354139e-02
+  [验证] step    20  held-out MSE = 1.712094e-02
+  [验证] step    30  held-out MSE = 1.322467e-02
+  [验证] step    40  held-out MSE = 1.081769e-02
+  [验证] step    50  held-out MSE = 9.302862e-03
+  [混合] step    50  loss = 9.414986e-03
+  [验证] step    60  held-out MSE = 8.329609e-03
+  [验证] step    70  held-out MSE = 7.690230e-03
+  [验证] step    80  held-out MSE = 7.260093e-03
+  [验证] step    90  held-out MSE = 6.963211e-03
+  [验证] step   100  held-out MSE = 6.752504e-03
+  [混合] step   100  loss = 6.234208e-03
+  [验证] step   110  held-out MSE = 6.598105e-03
+  [验证] step   120  held-out MSE = 6.480963e-03
+  [验证] step   130  held-out MSE = 6.388576e-03
+  [验证] step   140  held-out MSE = 6.312702e-03
+  [验证] step   150  held-out MSE = 6.247784e-03
+  [混合] step   150  loss = 5.306070e-03
+  [验证] step   160  held-out MSE = 6.190149e-03
+  [验证] step   170  held-out MSE = 6.137286e-03
+  [验证] step   180  held-out MSE = 6.087387e-03
+  [验证] step   190  held-out MSE = 6.039320e-03
+  [验证] step   200  held-out MSE = 5.992274e-03
+  [混合] step   200  loss = 4.776336e-03
+  [验证] step   210  held-out MSE = 5.945635e-03
+  [验证] step   220  held-out MSE = 5.899167e-03
+  [验证] step   230  held-out MSE = 5.852727e-03
+  [验证] step   240  held-out MSE = 5.806256e-03
+  [验证] step   250  held-out MSE = 5.759799e-03
+  [混合] step   250  loss = 4.370872e-03
+  [验证] step   260  held-out MSE = 5.713295e-03
+  [验证] step   270  held-out MSE = 5.666753e-03
+  [验证] step   280  held-out MSE = 5.620149e-03
+  [验证] step   290  held-out MSE = 5.573600e-03
+  [验证] step   300  held-out MSE = 5.527174e-03
+  [混合] step   300  loss = 4.028046e-03
+
+逐步训练日志已写入: /home/mindspore/work/scripts/../results/npu/training_log_copy_h64.csv
+
+==============================================================================
+混合过渡态报告 (topology=front_ms, exchange=copy) — 单次运行底线
+------------------------------------------------------------------------------
+  loss 曲线          : 4.898e-02 -> 4.028e-03  [PASS 收敛]
+  held-out 验证 MSE  : 4.622831e-02 -> 5.527174e-03  [PASS 泛化(无过拟合分歧)]
+  验证/训练终点比    : 1.37 (同量级即无病态过拟合)
+  MS 参照臂 loss     : 4.898e-02 -> 4.033e-03  [PASS 收敛]
+  切换等价性(混合/参照): loss 比 0.9987 (∈[0.5,2.0]) | held-out 比 0.9994 (≤1.01)  [PASS]
+  步时延(去预热)     : 混合 3.77 ms | MS参照 3.07 ms (范式代价披露, 非 dlpack 判据)
+  交换开销(含算子同步): 正向 288.0 us/步, 回传 211.1 us/步
+  交换信噪比(P2 口径) : 交换段占单步训练 13.24% (<1% 为佳)
+  [sanity] 初始 loss 一致性: |混合-参考|/参考 = 0.00e+00 (应 ≈ 0)
+  [PASS] M4 边界数值正确: 见上方标定输出
+------------------------------------------------------------------------------
+  说明: 数值一致性与耗时对照 (E2 vs E3) 由 scripts/make_report.py 汇总两份摘要生成。
+机器可读摘要已写入: /home/mindspore/work/results/npu/train_summary_h64_copy.json
+### [P1] 采样已停止, 数据: /home/mindspore/work/results/npu/smi_E3_20261111_115837.csv
+### [E3] 退出码 0  耗时 46.1 s
+
+##############################################################################
+### [5/6] E4 — 形态对称性: PT前段+MS后段 + MS 参照臂 (迁移过半形态)
+### cmd: /home/mindspore/work/.venv/bin/python /home/mindspore/work/scripts/train_hybrid.py --device npu --steps 300 --hidden 64 --batch 128 --lr 0.05 --rtol 5e-3 --eval-every 10 --seed 7 --topology front_pt
+##############################################################################
+### [P1] npu-smi 回退检测采样已启动: /home/mindspore/work/results/npu/smi_E4_20261111_115924.csv
+==============================================================================
+混合训练主对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=64  batch=128  exchange=dlpack
+==============================================================================
+
+--- M4 边界梯度标定 (同权重单次对照, torch 参考模型不参与训练) ---
+  [M4] 边界梯度标定 (fc2 边界): 桥接梯度 vs torch 参考梯度  max_rel_err=9.888e-07 (rtol=0.005)  [PASS]
+  [M4] 双锚-B0/MS参照: 桥接梯度 vs 纯 MS 端到端梯度  max_rel_err=2.924e-06  [PASS]
+
+--- MS 参照臂: 纯 MindSpore 端到端 (300 步, 客户现状形态) ---
+  [验证] step     0  held-out MSE = 4.622830e-02
+  [MS参照] step     1  loss = 4.897690e-02
+  [验证] step    10  held-out MSE = 2.436276e-02
+  [验证] step    20  held-out MSE = 1.760315e-02
+  [验证] step    30  held-out MSE = 1.351836e-02
+  [验证] step    40  held-out MSE = 1.099903e-02
+  [验证] step    50  held-out MSE = 9.416742e-03
+  [MS参照] step    50  loss = 9.545813e-03
+  [验证] step    60  held-out MSE = 8.402415e-03
+  [验证] step    70  held-out MSE = 7.737707e-03
+  [验证] step    80  held-out MSE = 7.291695e-03
+  [验证] step    90  held-out MSE = 6.984656e-03
+  [验证] step   100  held-out MSE = 6.767374e-03
+  [MS参照] step   100  loss = 6.258956e-03
+  [验证] step   110  held-out MSE = 6.608689e-03
+  [验证] step   120  held-out MSE = 6.488748e-03
+  [验证] step   130  held-out MSE = 6.394550e-03
+  [验证] step   140  held-out MSE = 6.317510e-03
+  [验证] step   150  held-out MSE = 6.251876e-03
+  [MS参照] step   150  loss = 5.316732e-03
+  [验证] step   160  held-out MSE = 6.193738e-03
+  [验证] step   170  held-out MSE = 6.140556e-03
+  [验证] step   180  held-out MSE = 6.090521e-03
+  [验证] step   190  held-out MSE = 6.042335e-03
+  [验证] step   200  held-out MSE = 5.995317e-03
+  [MS参照] step   200  loss = 4.783728e-03
+  [验证] step   210  held-out MSE = 5.948659e-03
+  [验证] step   220  held-out MSE = 5.902222e-03
+  [验证] step   230  held-out MSE = 5.855820e-03
+  [验证] step   240  held-out MSE = 5.809370e-03
+  [验证] step   250  held-out MSE = 5.762857e-03
+  [MS参照] step   250  loss = 4.376777e-03
+  [验证] step   260  held-out MSE = 5.716332e-03
+  [验证] step   270  held-out MSE = 5.669809e-03
+  [验证] step   280  held-out MSE = 5.623278e-03
+  [验证] step   290  held-out MSE = 5.576812e-03
+  [验证] step   300  held-out MSE = 5.530398e-03
+  [MS参照] step   300  loss = 4.033311e-03
+
+--- 对称混合臂: PT前段 ──▶ MS后段 (300 步, exchange=dlpack) ---
+  [验证] step     0  held-out MSE = 4.622830e-02
+  [对称混合] step     1  loss = 4.897690e-02
+  [验证] step    10  held-out MSE = 2.436276e-02
+  [验证] step    20  held-out MSE = 1.760315e-02
+  [验证] step    30  held-out MSE = 1.351836e-02
+  [验证] step    40  held-out MSE = 1.099903e-02
+  [验证] step    50  held-out MSE = 9.416742e-03
+  [对称混合] step    50  loss = 9.545813e-03
+  [验证] step    60  held-out MSE = 8.402415e-03
+  [验证] step    70  held-out MSE = 7.737707e-03
+  [验证] step    80  held-out MSE = 7.291695e-03
+  [验证] step    90  held-out MSE = 6.984655e-03
+  [验证] step   100  held-out MSE = 6.767374e-03
+  [对称混合] step   100  loss = 6.258956e-03
+  [验证] step   110  held-out MSE = 6.608689e-03
+  [验证] step   120  held-out MSE = 6.488748e-03
+  [验证] step   130  held-out MSE = 6.394550e-03
+  [验证] step   140  held-out MSE = 6.317510e-03
+  [验证] step   150  held-out MSE = 6.251876e-03
+  [对称混合] step   150  loss = 5.316732e-03
+  [验证] step   160  held-out MSE = 6.193738e-03
+  [验证] step   170  held-out MSE = 6.140556e-03
+  [验证] step   180  held-out MSE = 6.090521e-03
+  [验证] step   190  held-out MSE = 6.042335e-03
+  [验证] step   200  held-out MSE = 5.995316e-03
+  [对称混合] step   200  loss = 4.783728e-03
+  [验证] step   210  held-out MSE = 5.948659e-03
+  [验证] step   220  held-out MSE = 5.902222e-03
+  [验证] step   230  held-out MSE = 5.855821e-03
+  [验证] step   240  held-out MSE = 5.809370e-03
+  [验证] step   250  held-out MSE = 5.762857e-03
+  [对称混合] step   250  loss = 4.376776e-03
+  [验证] step   260  held-out MSE = 5.716333e-03
+  [验证] step   270  held-out MSE = 5.669810e-03
+  [验证] step   280  held-out MSE = 5.623279e-03
+  [验证] step   290  held-out MSE = 5.576812e-03
+  [验证] step   300  held-out MSE = 5.530398e-03
+  [对称混合] step   300  loss = 4.033311e-03
+
+逐步训练日志已写入: /home/mindspore/work/scripts/../results/npu/training_log_dlpack_h64_sym.csv
+
+==============================================================================
+混合过渡态报告 (topology=front_pt, exchange=dlpack) — 单次运行底线
+------------------------------------------------------------------------------
+  loss 曲线          : 4.898e-02 -> 4.033e-03  [PASS 收敛]
+  held-out 验证 MSE  : 4.622830e-02 -> 5.530398e-03  [PASS 泛化(无过拟合分歧)]
+  验证/训练终点比    : 1.37 (同量级即无病态过拟合)
+  MS 参照臂 loss     : 4.898e-02 -> 4.033e-03  [PASS 收敛]
+  切换等价性(混合/参照): loss 比 1.0000 (∈[0.5,2.0]) | held-out 比 1.0000 (≤1.01)  [PASS]
+  步时延(去预热)     : 混合 2.87 ms | MS参照 3.22 ms (范式代价披露, 非 dlpack 判据)
+  交换开销(含算子同步): 正向 66.4 us/步, 回传 52.0 us/步
+  交换信噪比(P2 口径) : 交换段占单步训练 4.12% (<1% 为佳)
+  [sanity] 初始 loss 一致性: |混合-参考|/参考 = 0.00e+00 (应 ≈ 0)
+  [PASS] M4 边界数值正确: 见上方标定输出
+------------------------------------------------------------------------------
+  说明: 数值一致性与耗时对照 (E2 vs E3) 由 scripts/make_report.py 汇总两份摘要生成。
+机器可读摘要已写入: /home/mindspore/work/results/npu/train_summary_h64_dlpack_sym.json
+### [P1] 采样已停止, 数据: /home/mindspore/work/results/npu/smi_E4_20261111_115924.csv
+### [E4] 退出码 0  耗时 46.2 s
+
+##############################################################################
+### [6/6] E5 — 纯交换吞吐尺寸扫描 (边界张量 32KB/1MB/4MB)
+### cmd: /home/mindspore/work/.venv/bin/python /home/mindspore/work/scripts/train_hybrid.py --device npu --hidden 64 --bench --bench-sizes 128,4096,16384 --bench-n 200
+##############################################################################
+==============================================================================
+混合训练主对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=64  batch=128  exchange=dlpack
+==============================================================================
+==============================================================================
+纯交换吞吐尺寸扫描  device=npu:0  hidden=64 float32  N=200 (预热 10)
+------------------------------------------------------------------------------
+  边界张量   32 KB (batch=   128)
+    正向 MS→PT : dlpack      15.0 us/次 | copy     199.3 us/次 (copy 慢   13.2x)
+    回传 PT→MS : dlpack      14.0 us/次 | copy     120.9 us/次 (copy 慢    8.6x)
+  边界张量  1.0 MB (batch=  4096)
+    正向 MS→PT : dlpack      14.9 us/次 | copy     716.9 us/次 (copy 慢   48.2x)
+    回传 PT→MS : dlpack     114.4 us/次 | copy     612.0 us/次 (copy 慢    5.4x)
+  边界张量  4.0 MB (batch= 16384)
+    正向 MS→PT : dlpack      14.8 us/次 | copy    1974.7 us/次 (copy 慢  133.0x)
+    回传 PT→MS : dlpack     432.7 us/次 | copy    1936.0 us/次 (copy 慢    4.5x)
+------------------------------------------------------------------------------
+  说明: dlpack 全程留在 device 内存; copy 每次交换含 NPU<->host 往返与流同步;收益随边界张量增大线性放大(真实模型边界张量更大, 收益只会更显著)。
+机器可读摘要已写入: /home/mindspore/work/results/npu/bench_summary.json
+### [E5] 退出码 0  耗时 45.4 s
+
+##############################################################################
+### 全部 6 个阶段通过, 总耗时 4.1 分钟
+##############################################################################
+### 数据结果工作簿: /home/mindspore/work/results/npu/results_20261111_120055.xlsx
+### 完整日志: /home/mindspore/work/results/npu/run_all_20261111_115647.log
+### 下一步: 把 results/ 目录拷回 Windows, 运行 python scripts/make_report.py 生成最终验证报告
