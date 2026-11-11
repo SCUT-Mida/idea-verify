@@ -2,3 +2,7 @@
 .idea
 .venv
 .zcode
+
+__pycache__/
+*.pyc
+results_*.xlsx
