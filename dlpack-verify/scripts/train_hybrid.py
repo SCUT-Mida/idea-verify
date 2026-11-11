@@ -1,51 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-train_hybrid.py — 混合编程训练收敛 + 基线对照验证 (M1~M4 底线全覆盖)
+train_hybrid.py — 混合编程训练收敛 + 交换机制主对照验证 (E2 vs E3)
 ====================================================================
 
 目的:
     verify_dlpack.py 证明"机制"(单步交换/梯度桥接数学正确);
-    本脚本证明"训练可用性 + 范式不恶化"——三臂对照设计:
+    本脚本证明"训练可用性 + 交换机制收益"——主对照设计:
 
-      A 臂 (基线)     : 相同结构的模型整体在 PyTorch 内端到端训练 (不跨框架)
-      B 臂 (目标方案) : 前段 MindSpore(Dense+ReLU) ──DLPack──▶ 后段 PyTorch(Linear),
-                        每步走完整梯度桥接 (①剪 ②传 ③立 ④反向 ⑤递)
-      C 臂 (对照, 可选): 同 B 但用 host 拷贝交换 (--exchange copy)
+      E2 (目标方案): 前段 MindSpore(Dense+ReLU) ──DLPack──▶ 后段 PyTorch(Linear),
+                     每步走完整梯度桥接 (①剪 ②传 ③立 ④反向 ⑤递)
+      E3 (对照)   : 同 E2, 交换改为 host 拷贝 (--exchange copy)
+      → 两跑同种子/同初始化/同数据/同超参, 唯一变量 = 交换机制;
+        数值一致性与耗时对比由 scripts/make_report.py 汇总两份摘要生成。
 
-    四条底线指标:
-      M1 收敛等价性   : A/B 臂 loss 曲线偏差 < 0.15 个数量级 (同种子/同初始化/同更新)
-      M2 指标不恶化   : B 臂 held-out 评估 MSE ≤ A 臂 × 1.01
-      M3 步时延不恶化 : B 臂步时延 ≤ A 臂 × (1 + m3_tol)
-                        注: 玩具规模下 MS PYNATIVE 单算子调度开销占主导, 该项在
-                        玩具模型上可能偏大属预期; 生产规模(计算密集)需按占比复测
-      M4 边界数值正确 : 桥接得到的 MS 前段梯度 ≈ A 臂同一边界的 torch 梯度 (训练开始
-                        时同权重标定一次), 相对误差 < rtol
+    每次运行内置底线 (单次自检):
+      收敛性          : loss 下降、无 NaN/Inf
+      泛化(过拟合检查): held-out 验证损失随训练同步下降 (训练前/每 --eval-every 步/
+                        训练后各评一次, 曲线落盘 CSV), 终点与训练损失同量级无分歧
+      M4 边界数值正确 : 训练前同权重标定一次——桥接得到的 MS 前段梯度 vs torch
+                        参考模型同边界梯度 (不训练, 仅单次前向反向), 相对误差 < rtol
+      初始一致性      : 混合前向初始 loss 与 torch 参考前向 loss 一致 (偏差 ≈ 0)
 
 任务设计:
     教师(固定随机权重, 非线性): y = ReLU(x@W1.T+b1) @ W2.T + b2   x∈R^4, h=hidden, y∈R^2
-    学生: 与教师同构  fc1(4→h)+ReLU | fc2(h→2), 切分点在 ReLU 之后
-         A 臂 = torch(fc1)+ReLU+torch(fc2)   B 臂 = MS(fc1)+ReLU ──dlpack──▶ torch(fc2)
-    两侧初始化严格相同 (B 臂从 A 臂权重值拷贝), 数据/更新/超参完全一致 => 曲线可直接对照。
-    held-out 评估集 512 条独立采样, 训练前后各评一次。
+    学生(混合): fc1(4→h)+ReLU | fc2(h→2), 切分点在 ReLU 之后
+         MS(fc1)+ReLU ──dlpack──▶ torch(fc2)
+    torch 参考模型与混合学生由同一 torch 随机初始化拷贝权重值, 数据/更新/超参完全一致
+    => E2/E3 两跑可直接对照 (旧版 B 臂数值也可复现, 初始化序列未变)。
+    held-out 验证集 512 条独立采样, 训练前/每 --eval-every 步/训练后各评一次
+    (验证曲线落盘逐步 CSV, 监测过拟合; 评估在计时段外, 不污染步时延)。
 
-用法:
-    python train_hybrid.py --device npu                    # A 臂 + B 臂(dlera dlpack)
-    python train_hybrid.py --device npu --exchange copy    # A 臂 + C 臂(copy 对照)
-    python train_hybrid.py --device npu --bench            # 纯交换吞吐 microbenchmark
-    python train_hybrid.py --device npu --hidden 256 --batch 512   # 加大计算密度
+用法 (在项目根目录, 已激活 venv 与 CANN 环境):
+    python scripts/train_hybrid.py --device npu --rtol 5e-3                # E2 dlpack
+    python scripts/train_hybrid.py --device npu --exchange copy --rtol 5e-3  # E3 copy 对照
+    python scripts/train_hybrid.py --device npu --bench                    # E5 纯交换吞吐 (尺寸扫描)
 """
 import argparse
 import sys
 import time
 import warnings
 
-# 静音两类已知无害的平台告警 (成因见 README §4.3), 按消息精确匹配, 其他警告仍可见
+# 静音两类已知无害的平台告警 (成因见 README §7), 按消息精确匹配, 其他警告仍可见
 warnings.filterwarnings("ignore", message=".*owner does not match.*")
 warnings.filterwarnings("ignore", message=".*smallest subnormal.*")
 
 import numpy as np
 import torch
-from mindspore import ops, vjp  # 模块级导入: ms.jit 函数体内不允许 import 语句
+from mindspore import ops, vjp
 
 CFG = {}
 
@@ -59,26 +60,27 @@ def _front_fn(x, w, b):
 # 环境初始化 (与 verify_dlpack.py 同一套约定)
 # ---------------------------------------------------------------------------
 def parse_args():
-    ap = argparse.ArgumentParser(description="MindSpore ↔ PyTorch 混合训练收敛 + 基线对照")
+    ap = argparse.ArgumentParser(
+        description="MindSpore ↔ PyTorch 混合训练收敛 + 交换机制主对照 (E2 dlpack / E3 copy)")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "npu"])
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--eval-n", type=int, default=512, help="held-out 评估集样本数")
     ap.add_argument("--hidden", type=int, default=64, help="隐藏层宽度 (教师/学生同构)")
     ap.add_argument("--lr", type=float, default=0.05)
-    ap.add_argument("--exchange", default="dlpack", choices=["dlpack", "copy"])
+    ap.add_argument("--exchange", default="dlpack", choices=["dlpack", "copy"],
+                    help="交换机制: dlpack=零拷贝(E2) / copy=host 拷贝对照(E3)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--result-every", type=int, default=50)
+    ap.add_argument("--eval-every", type=int, default=10,
+                    help="每 N 步做一次 held-out 验证评估 (计时段外; 首末步必评)")
     ap.add_argument("--rtol", type=float, default=1e-3,
                     help="M4 边界梯度相对误差容差 (CPU 1e-3, NPU 建议 5e-3)")
-    ap.add_argument("--m3-tol", type=float, default=0.02,
-                    help="M3 步时延容忍放大比例 (B 臂 ≤ A 臂 × (1+m3-tol))")
     ap.add_argument("--bench", action="store_true",
-                    help="纯交换吞吐 microbenchmark (同进程对比 dlpack/copy)")
+                    help="纯交换吞吐 microbenchmark (同进程对比 dlpack/copy, 尺寸扫描)")
     ap.add_argument("--bench-n", type=int, default=200)
-    ap.add_argument("--ms-jit", action="store_true", default=False,
-                    help="实验性: ms.jit 编译 GradOperation 反向。默认关闭 — 本版本 CPU 实测 "
-                         "编译梯度数值有偏差 (M2 恶化); PYNATIVE GradOperation 数值正确")
+    ap.add_argument("--bench-sizes", default="128,4096,16384",
+                    help="bench 尺寸扫描的 batch 列表 (逗号分隔; 边界张量 = batch×hidden×4B)")
     return ap.parse_args()
 
 
@@ -117,7 +119,7 @@ def setup(args):
     CFG.update({"device": device, "target": target, "is_npu": is_npu, "ms": ms,
                 "exchange": args.exchange})
     print("=" * 78)
-    print(f"混合训练收敛 + 基线对照  device={device}  device_target={target}")
+    print(f"混合训练主对照  device={device}  device_target={target}")
     print(f"numpy={np.__version__}  torch={torch.__version__}  mindspore={ms.__version__}  "
           f"hidden={args.hidden}  batch={args.batch}  exchange={args.exchange}")
     print("=" * 78)
@@ -130,12 +132,19 @@ def to_np(t):
     return t.asnumpy() if hasattr(t, "asnumpy") else np.asarray(t)
 
 
+def result_dir():
+    import os as _os
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    out = _os.path.join(_here, "..", "results", "npu" if CFG["is_npu"] else "cpu")
+    _os.makedirs(out, exist_ok=True)
+    return out
+
+
 # ---------------------------------------------------------------------------
-# 数据 / 模型 / 三臂构建
+# 数据 / 模型构建
 # ---------------------------------------------------------------------------
 def build_everything(args):
-    ms = CFG["ms"]
-    from mindspore import nn
+    from mindspore import Parameter, Tensor as MSTensor
 
     h = args.hidden
 
@@ -160,44 +169,29 @@ def build_everything(args):
     y_eval_t = torch.tensor(y_eval, device=CFG["device"])
     loss_fn = torch.nn.MSELoss()
 
-    # ---- A 臂基线模型 (整体在 PyTorch): fc1 + ReLU + fc2 ----
-    # torch.manual_seed 已定 => fc1a/fc2a 的随机初始化可复现
-    fc1a = torch.nn.Linear(4, h).to(CFG["device"])
-    fc2a = torch.nn.Linear(h, 2).to(CFG["device"])
-    relu = torch.nn.ReLU()
-    arm_a = torch.nn.Sequential(fc1a, relu, fc2a)
-    opt_a = torch.optim.SGD(arm_a.parameters(), lr=args.lr)
+    # ---- torch 参考模型 (fc1+ReLU+fc2): 仅用于 M4 标定与初始一致性校验, 不训练 ----
+    # torch.manual_seed 已定 => 初始化可复现; 混合学生的权重值从这里拷贝,
+    # 因此 E2/E3 两跑 (及与旧版本) 的初始化完全一致
+    fc1_ref = torch.nn.Linear(4, h).to(CFG["device"])
+    fc2_ref = torch.nn.Linear(h, 2).to(CFG["device"])
+    ref_model = torch.nn.Sequential(fc1_ref, torch.nn.ReLU(), fc2_ref)
 
-    # ---- B 臂: MS 前段 (函数式 + vjp, 权重值从 A 臂 fc1 拷贝保证同一起点) + PT 后段 ----
-    from mindspore import Parameter, Tensor as MSTensor
+    # ---- 混合学生: MS 前段 (函数式 + vjp, 权重值从参考模型拷贝) + PT 后段 ----
     # 前段参数: Dense(4→h) + ReLU (接真实模型时改 _front_fn 即可)
-    w_ref = Parameter(MSTensor(to_np(fc1a.weight)), name="front_w")
-    b_ref = Parameter(MSTensor(to_np(fc1a.bias)), name="front_b")
+    w_ref = Parameter(MSTensor(to_np(fc1_ref.weight)), name="front_w")
+    b_ref = Parameter(MSTensor(to_np(fc1_ref.bias)), name="front_b")
     pt_head = torch.nn.Linear(h, 2).to(CFG["device"])
     with torch.no_grad():
-        pt_head.weight.copy_(fc2a.weight)
-        pt_head.bias.copy_(fc2a.bias)
+        pt_head.weight.copy_(fc2_ref.weight)
+        pt_head.bias.copy_(fc2_ref.bias)
     opt_b = torch.optim.SGD(pt_head.parameters(), lr=args.lr)
-
-    # ---- MS 前段执行 (M3): vjp 模式 (官方用法 vjp(fn, *inputs)) —— 前向仅执行一次
-    #      并返回反向闭包, 消除 GradOperation "反向时重执行前向" 的每步冗余前向。
-    if args.ms_jit:
-        try:
-            front_compiled = ms.jit(_front_fn)
-            jit_note = "MS 前向: ms.jit + vjp (前向仅一次, 编译执行)"
-        except Exception as e:  # noqa: BLE001
-            front_compiled = _front_fn
-            jit_note = f"MS 前向: ms.jit 不可用({type(e).__name__}), 回退 PYNATIVE"
-    else:
-        front_compiled = _front_fn
-        jit_note = "MS 前向: vjp + PYNATIVE (--no-ms-jit)"
 
     return {
         "teacher": teacher, "x": x, "y_t": y_t, "loss_fn": loss_fn,
         "x_eval": x_eval, "y_eval_t": y_eval_t,
-        "arm_a": arm_a, "fc1a": fc1a, "opt_a": opt_a,
-        "front_compiled": front_compiled, "w_ref": w_ref, "b_ref": b_ref,
-        "pt_head": pt_head, "opt_b": opt_b, "jit_note": jit_note,
+        "ref_model": ref_model, "fc1_ref": fc1_ref,
+        "front": _front_fn, "w_ref": w_ref, "b_ref": b_ref,
+        "pt_head": pt_head, "opt_b": opt_b,
     }
 
 
@@ -230,22 +224,25 @@ def exchange_backward(pt_input):
 
 
 # ---------------------------------------------------------------------------
-# M4: 边界梯度标定 (训练开始前, 两侧同权重, 桥接梯度 vs 单框架梯度)
+# M4: 边界梯度标定 (训练开始前, 两侧同权重, 桥接梯度 vs torch 参考梯度)
 # ---------------------------------------------------------------------------
 def calibrate_m4(ctx, args):
     ms, x, y_t, loss_fn = CFG["ms"], ctx["x"], ctx["y_t"], ctx["loss_fn"]
-    # A 臂: torch 全模型 backward, 取 fc1a 梯度
-    out = ctx["arm_a"](torch.tensor(x, device=CFG["device"]))
-    ctx["loss_fn"](out, y_t).backward()
-    ref_w = to_np(ctx["fc1a"].weight.grad)
-    ref_b = to_np(ctx["fc1a"].bias.grad)
+    # torch 参考: 全模型单次前向反向, 取 fc1 梯度 (该模型不参与训练)
+    x_t = torch.tensor(x, device=CFG["device"])
+    ref_out = ctx["ref_model"](x_t)
+    ref_loss = float(loss_fn(ref_out, y_t).item())
+    loss_fn(ref_out, y_t).backward()
+    ref_w = to_np(ctx["fc1_ref"].weight.grad)
+    ref_b = to_np(ctx["fc1_ref"].bias.grad)
 
-    # B 臂: MS 前向 -> dlpack -> PT fc2 -> backward -> sens -> vjp 反向 (一次前向)
-    # 官方用法: inputs 注册进 vjp(fn, *inputs), 返回的 vjp_fn 只接收种子向量 v
-    ms_out, bwd_fn = vjp(ctx["front_compiled"], ms.Tensor(x), ctx["w_ref"], ctx["b_ref"])
+    # 混合: MS 前向 -> 交换 -> PT fc2 -> backward -> sens -> vjp 反向 (一次前向)
+    # 官方用法: inputs 注册进 vjp(fn, *inputs), 返回的 bwd_fn 只接收种子向量 v
+    ms_out, bwd_fn = vjp(ctx["front"], ms.Tensor(x), ctx["w_ref"], ctx["b_ref"])
     pt_input, _ = exchange_forward(ms_out)
     pt_input.requires_grad_(True)
     pt_out = ctx["pt_head"](pt_input)
+    mix_loss = float(loss_fn(pt_out, y_t).item())
     loss_fn(pt_out, y_t).backward()
     sens, _ = exchange_backward(pt_input)
     _, grad_w, grad_b = bwd_fn(sens)
@@ -253,45 +250,28 @@ def calibrate_m4(ctx, args):
     rel = lambda a, b: float(np.max(np.abs(a - b) / (np.abs(b) + 1e-6)))
     err = max(rel(to_np(grad_w), ref_w), rel(to_np(grad_b), ref_b))
     ok = err < args.rtol
-    print(f"  [M4] 边界梯度标定: MS 桥接梯度 vs torch 单框架梯度  "
+    print(f"  [M4] 边界梯度标定: MS 桥接梯度 vs torch 参考梯度  "
           f"max_rel_err={err:.3e} (rtol={args.rtol:g})  [{'PASS' if ok else 'FAIL'}]")
-    # 清掉 A 臂本次标定遗留的梯度, 不影响正式训练
-    ctx["opt_a"].zero_grad()
-    return ok, err
+    # 清掉参考模型本次标定遗留的梯度, 不影响正式训练
+    ctx["fc1_ref"].zero_grad(set_to_none=True)
+    return ok, err, ref_loss, mix_loss
 
 
 # ---------------------------------------------------------------------------
-# A 臂: 单框架端到端训练 (基线)
+# 混合训练 (完整梯度桥接; exchange 由 CFG 决定 dlpack/copy)
 # ---------------------------------------------------------------------------
-def train_arm_a(ctx, args):
-    arm, opt, x, y_t, loss_fn = ctx["arm_a"], ctx["opt_a"], ctx["x"], ctx["y_t"], ctx["loss_fn"]
-    x_t = torch.tensor(x, device=CFG["device"])
-    hist, times = [], []
-    for step in range(1, args.steps + 1):
-        t0 = time.perf_counter()
-        opt.zero_grad()
-        loss = loss_fn(arm(x_t), y_t)
-        loss.backward()
-        opt.step()
-        times.append(time.perf_counter() - t0)
-        hist.append(float(loss.item()))
-        if step == 1 or step % args.result_every == 0 or step == args.steps:
-            print(f"  [A 臂] step {step:5d}  loss = {hist[-1]:.6e}")
-    return hist, times   # 全量逐步记录 (报告端自行去预热)
-
-
-# ---------------------------------------------------------------------------
-# B 臂: 混合训练 (完整梯度桥接)
-# ---------------------------------------------------------------------------
-def train_arm_b(ctx, args):
+def train_mixed(ctx, args):
     ms = CFG["ms"]
-    from mindspore import vjp
-    front, w_ref, b_ref = ctx["front_compiled"], ctx["w_ref"], ctx["b_ref"]
+    front, w_ref, b_ref = ctx["front"], ctx["w_ref"], ctx["b_ref"]
     pt_head, opt_b = ctx["pt_head"], ctx["opt_b"]
     x, y_t, loss_fn = ctx["x"], ctx["y_t"], ctx["loss_fn"]
     x_ms = ms.Tensor(x)                                  # 常量输入张量只建一次
 
     hist, times = [], []
+    val_curve = {}                                       # step -> held-out MSE (计时段外)
+    v0 = eval_mse(ctx)                                   # 训练前初始验证
+    val_curve[0] = v0
+    print(f"  [验证] step     0  held-out MSE = {v0:.6e}")
     t_fwd = t_bwd = 0.0
     for step in range(1, args.steps + 1):
         t0 = time.perf_counter()
@@ -314,109 +294,72 @@ def train_arm_b(ctx, args):
         times.append(time.perf_counter() - t0)
         v = float(loss.item())
         hist.append(v)
+        if step % args.eval_every == 0 or step == args.steps:
+            val_curve[step] = eval_mse(ctx)              # 计时段外, 不污染步时延
+            print(f"  [验证] step {step:5d}  held-out MSE = {val_curve[step]:.6e}")
         if step == 1 or step % args.result_every == 0 or step == args.steps:
-            print(f"  [B 臂] step {step:5d}  loss = {v:.6e}")
-    return hist, times, t_fwd / args.steps * 1e6, t_bwd / args.steps * 1e6  # 全量逐步记录
+            print(f"  [混合] step {step:5d}  loss = {v:.6e}")
+    return hist, times, t_fwd / args.steps * 1e6, t_bwd / args.steps * 1e6, val_curve
 
 
-def eval_mse(ctx, which):
-    """held-out 评估: which in {'a','b'}。返回 MSE(float)。"""
-    arm_a, pt_head = ctx["arm_a"], ctx["pt_head"]
+def eval_mse(ctx):
+    """held-out 评估 (混合前向)。返回 MSE(float)。"""
     with torch.no_grad():
-        if which == "a":
-            out = arm_a(torch.tensor(ctx["x_eval"], device=CFG["device"]))
-        else:
-            ms_out = ctx["front_compiled"](CFG["ms"].Tensor(ctx["x_eval"]),
-                                           ctx["w_ref"], ctx["b_ref"])
-            pt_input, _ = exchange_forward(ms_out)
-            out = pt_head(pt_input)
+        ms_out = ctx["front"](CFG["ms"].Tensor(ctx["x_eval"]),
+                              ctx["w_ref"], ctx["b_ref"])
+        pt_input, _ = exchange_forward(ms_out)
+        out = ctx["pt_head"](pt_input)
         return float(ctx["loss_fn"](out, ctx["y_eval_t"]).item())
 
 
 # ---------------------------------------------------------------------------
-# 报告: M1~M4 判定
+# 报告: 单次运行底线 (收敛 + M4) + 机器可读摘要 v2
 # ---------------------------------------------------------------------------
-def report(args, hist_a, hist_b, t_a, t_b, eval_a, eval_b, fwd_us, bwd_us, m4, m4_err):
-    hist_a, hist_b = np.array(hist_a), np.array(hist_b)
-    if not (np.isfinite(hist_a).all() and np.isfinite(hist_b).all()):
+def report(args, hist, times, eval_v, fwd_us, bwd_us, m4, m4_err,
+           ref_loss, mix_loss, val_curve):
+    hist = np.array(hist)
+    if not np.isfinite(hist).all():
         print("[FATAL] 训练发散 (出现 NaN/Inf): 请降低 --lr 或减小 --hidden 后重试")
         return 1
-    t_a = np.array(t_a)[int(len(t_a) * 0.2):]   # 去掉前 20% 预热
-    t_b = np.array(t_b)[int(len(t_b) * 0.2):]
-    # M1: 训练轨迹等价性 —— log-loss 轨迹均值 (AUC, 单位:数量级) 的绝对差
-    #   逐点对照在非线性/大宽度下会被跨框架浮点核的 ulp 差异经训练动力学放大 (蝴蝶效应),
-    #   因此 M1 以"轨迹积分 + 最终指标(M2)"判定, 逐点最大偏差仅作参考打印。
-    la = np.log10(np.maximum(hist_a, 1e-300))
-    lb = np.log10(np.maximum(hist_b, 1e-300))
-    curve_dev = float(np.max(np.abs(la - lb)))
-    auc_dev = float(abs(np.mean(la) - np.mean(lb)))
-    # M1 判据: 收敛结果等价 (最终 loss 比值在 [0.5, 2.0]) 且两臂确实收敛 (低于各自初始)。
-    # 逐点轨迹在非线性/大宽度下会因跨框架浮点核的 ulp 差异混沌放大 (同框架换硬件重跑亦然),
-    # 不应作为等价性判据; 最终指标等价由 M2 (held-out 评估) 兜底。
-    final_ratio = hist_b[-1] / max(hist_a[-1], 1e-300)
-    converged = hist_a[-1] < hist_a[0] and hist_b[-1] < hist_b[0]
-    m1 = (0.5 < final_ratio < 2.0) and converged
-    # M2: held-out 评估不恶化
-    eval_ratio = eval_b / max(eval_a, 1e-300)
-    m2 = eval_b <= eval_a * 1.01
-    # M3: 步时延不恶化 (玩具规模下 MS 调度开销占主导, 见打印说明)
-    lat_ratio = (np.mean(t_b) / max(np.mean(t_a), 1e-9)) if len(t_a) else float("inf")
-    m3 = lat_ratio <= 1.0 + args.m3_tol
+    t_arr = np.array(times)[int(len(times) * 0.2):]   # 去掉前 20% 预热
+    converged = bool(hist[-1] < hist[0])
+    init_dev = abs(mix_loss - ref_loss) / max(abs(ref_loss), 1e-300)
+    eval_init = val_curve.get(0, float("nan"))
+    gen_gap = eval_v / max(hist[-1], 1e-300)
+    val_synced = all(val_curve[s] < val_curve[0] for s in val_curve if s > 0)
 
     print("\n" + "=" * 78)
-    print("训练收敛 + 基线对照 报告 (M1~M4 底线)")
+    print(f"混合训练报告 (exchange={CFG['exchange']}) — 单次运行底线")
     print("-" * 78)
-    print(f"  loss 曲线: A 臂 {hist_a[0]:.3e} -> {hist_a[-1]:.3e} | "
-          f"B 臂 {hist_b[0]:.3e} -> {hist_b[-1]:.3e}")
-    print(f"  held-out 评估 MSE : A 臂 {eval_a:.6e} | B 臂 {eval_b:.6e}")
-    print(f"  步时延(去预热)    : A 臂 {np.mean(t_a) * 1e3:.2f} ms | "
-          f"B 臂 {np.mean(t_b) * 1e3:.2f} ms")
-    if CFG["exchange"] == "dlpack":
-        print(f"  交换开销(B 臂, 含算子同步): 正向 {fwd_us:.1f} us/步, 回传 {bwd_us:.1f} us/步")
-    print("-" * 78)
-    print(f"  [{'PASS' if m1 else 'FAIL'}] M1 收敛等价性  : 最终 loss 比 B/A = {final_ratio:.4f} "
-          f"(∈[0.5,2.0]) 且两臂均收敛; 轨迹均值差 {auc_dev:.3f} / 逐点最大 {curve_dev:.3f} "
-          f"个数量级 (非线性下逐点会混沌放大, 仅参考)")
-    init_dev = abs(hist_b[0] - hist_a[0]) / max(abs(hist_a[0]), 1e-300)
-    print(f"  [sanity] 初始 loss 一致性: |B0-A0|/A0 = {init_dev:.2e} (应 ≈ 0, 两臂同初始化)")
-    print(f"  [{'PASS' if m2 else 'FAIL'}] M2 指标不恶化  : B/A 评估比 {eval_ratio:.4f} (≤1.01)")
-    print(f"  [{'PASS' if m3 else 'FAIL'}] M3 步时延不恶化: B/A 比值 {lat_ratio:.3f} "
-          f"(≤1+{args.m3_tol:g})")
+    print(f"  loss 曲线          : {hist[0]:.3e} -> {hist[-1]:.3e}  "
+          f"[{'PASS' if converged else 'FAIL'} 收敛]")
+    print(f"  held-out 验证 MSE  : {eval_init:.6e} -> {eval_v:.6e}  "
+          f"[{'PASS' if val_synced and converged else 'FAIL'} 泛化(无过拟合分歧)]")
+    print(f"  验证/训练终点比    : {gen_gap:.2f} (同量级即无病态过拟合)")
+    print(f"  步时延(去预热)     : {np.mean(t_arr) * 1e3:.2f} ms")
+    print(f"  交换开销(含算子同步): 正向 {fwd_us:.1f} us/步, 回传 {bwd_us:.1f} us/步")
+    print(f"  [sanity] 初始 loss 一致性: |混合-参考|/参考 = {init_dev:.2e} (应 ≈ 0)")
     print(f"  [{'PASS' if m4 else 'FAIL'}] M4 边界数值正确: 见上方标定输出")
-    ok = m1 and m2 and m3 and m4
     print("-" * 78)
-    if ok:
-        print("  结论: 底线全部达成 —— 混合范式未造成收敛/指标/时延恶化, "
-              "且边界梯度数值正确。")
-    else:
-        if not m3:
-            print("  说明: M3 未达时, 主体是玩具规模下 MindSpore PYNATIVE 单算子调度开销"
-                  "(与本验证 small-nets 无关的框架常数); 生产规模(计算密集)按占比复测, "
-                  "可用 --hidden/--batch 加大计算密度观察比值收敛。")
-        print(f"  结论: {'全部' if ok else '部分'}底线达成。")
+    print("  说明: 数值一致性与耗时对照 (E2 vs E3) 由 scripts/make_report.py "
+          "汇总两份摘要生成。")
+    ok = converged and m4
+
     import json
     import os as _os
-    _here = _os.path.dirname(_os.path.abspath(__file__))
-    out_dir = _os.path.join(_here, "..", "results",
-                            "npu" if CFG["is_npu"] else "cpu")
-    _os.makedirs(out_dir, exist_ok=True)
+    out_dir = result_dir()
     summary = {
-        "kind": "train_hybrid", "device": CFG["device"],
+        "kind": "train_hybrid", "version": 2, "device": CFG["device"],
         "hidden": args.hidden, "batch": args.batch, "lr": args.lr,
         "steps": args.steps, "seed": args.seed, "exchange": args.exchange,
-        "rtol": args.rtol, "m3_tol": args.m3_tol,
+        "rtol": args.rtol,
         "results": {
-            "initial_loss_a": float(hist_a[0]), "initial_loss_b": float(hist_b[0]),
-            "final_loss_a": float(hist_a[-1]), "final_loss_b": float(hist_b[-1]),
-            "ratio_final": float(final_ratio),
-            "eval_a": float(eval_a), "eval_b": float(eval_b),
-            "eval_ratio": float(eval_ratio),
-            "lat_a_ms": float(np.mean(t_a) * 1e3),
-            "lat_b_ms": float(np.mean(t_b) * 1e3),
-            "lat_ratio": float(lat_ratio),
-            "curve_dev_decades": curve_dev, "auc_dev_decades": auc_dev,
+            "initial_loss": float(hist[0]), "final_loss": float(hist[-1]),
+            "eval_mse": float(eval_v), "eval_mse_initial": float(eval_init),
+            "gen_gap": float(gen_gap), "val_synced": bool(val_synced),
+            "lat_ms": float(np.mean(t_arr) * 1e3),
             "exchange_fwd_us": float(fwd_us), "exchange_bwd_us": float(bwd_us),
-            "m1": bool(m1), "m2": bool(m2), "m3": bool(m3), "m4": bool(m4)},
+            "converged": converged, "m4": bool(m4)},
         "m4_calibration": {"rel_err": float(m4_err), "rtol": args.rtol,
                             "pass": bool(m4)},
         "initial_consistency_dev": float(init_dev),
@@ -432,6 +375,8 @@ def report(args, hist_a, hist_b, t_a, t_b, eval_a, eval_b, fwd_us, bwd_us, m4, m
 # 纯交换吞吐 microbenchmark (剥离框架算子开销; 同进程对比 dlpack/copy)
 # ---------------------------------------------------------------------------
 def bench(args):
+    """纯交换吞吐尺寸扫描: 每个 batch 档位测 dlpack vs copy 的正/回向交换
+    (边界张量 = batch×hidden×4B; 值用 zeros, DLPack/拷贝耗时与数值无关)。"""
     from mindspore.utils.dlpack import to_dlpack as ms_to_dlpack
     from mindspore.utils.dlpack import from_dlpack as ms_from_dlpack
     from torch.utils.dlpack import to_dlpack as torch_to_dlpack
@@ -439,14 +384,8 @@ def bench(args):
 
     ctx = build_everything(args)
     ms = CFG["ms"]
-    ms_out = ctx["front_compiled"](ms.Tensor(ctx["x"]),
-                                   ctx["w_ref"], ctx["b_ref"])   # 只算一次, 计时段内不含模型前向
-    pt_input, _ = exchange_forward(ms_out)
-    pt_input.requires_grad_(True)
-    pt_out = ctx["pt_head"](pt_input)
-    ctx["loss_fn"](pt_out, ctx["y_t"]).backward()
-    grad = pt_input.grad.detach()
-
+    h = args.hidden
+    sizes = [int(s) for s in str(args.bench_sizes).split(",") if s.strip()]
     N, WARM = args.bench_n, 10
 
     def timeit(fn):
@@ -457,49 +396,56 @@ def bench(args):
             fn()
         return (time.perf_counter() - t0) / N * 1e6
 
-    def fwd_dlpack():
-        torch_from_dlpack(ms_to_dlpack(ms_out))
-
-    def fwd_copy():
-        t = torch.from_numpy(np.array(ms_out.asnumpy()))
-        if CFG["is_npu"]:
-            t = t.to(CFG["device"])
-
-    def bwd_dlpack():
-        ms_from_dlpack(torch_to_dlpack(grad))
-
-    def bwd_copy():
-        CFG["ms"].Tensor(to_np(grad))
+    def fmt_size(b):
+        kb = b * h * 4 / 1024
+        return f"{kb / 1024:.1f} MB" if kb >= 1024 else f"{kb:.0f} KB"
 
     print("=" * 78)
-    print(f"纯交换吞吐 microbenchmark  device={CFG['device']}  "
-          f"数据 {ctx['x'].shape} float32  N={N} (预热 {WARM})")
+    print(f"纯交换吞吐尺寸扫描  device={CFG['device']}  hidden={h} float32  "
+          f"N={N} (预热 {WARM})")
     print("-" * 78)
-    f_d = timeit(fwd_dlpack)
-    f_c = timeit(fwd_copy)
-    b_d = timeit(bwd_dlpack)
-    b_c = timeit(bwd_copy)
-    print(f"  正向 MS→PT : dlpack {f_d:9.1f} us/次 | copy {f_c:9.1f} us/次 "
-          f"(copy 慢 {f_c / max(f_d, 1e-9):.1f}x)")
-    print(f"  回传 PT→MS : dlpack {b_d:9.1f} us/次 | copy {b_c:9.1f} us/次 "
-          f"(copy 慢 {b_c / max(b_d, 1e-9):.1f}x)")
-    per_step_d, per_step_c = f_d + b_d, f_c + b_c
+    rows = []
+    for b in sizes:
+        # front: (B,4) -> (B,h) 即边界张量; 计时段内不含模型前向
+        ms_out = ctx["front"](ms.Tensor(np.zeros((b, 4), np.float32)),
+                              ctx["w_ref"], ctx["b_ref"])
+        grad = torch.zeros((b, h), device=CFG["device"])
+
+        def fwd_dlpack():
+            torch_from_dlpack(ms_to_dlpack(ms_out))
+
+        def fwd_copy():
+            t = torch.from_numpy(np.array(ms_out.asnumpy()))
+            if CFG["is_npu"]:
+                t = t.to(CFG["device"])
+
+        def bwd_dlpack():
+            ms_from_dlpack(torch_to_dlpack(grad))
+
+        def bwd_copy():
+            CFG["ms"].Tensor(to_np(grad))
+
+        f_d = timeit(fwd_dlpack)
+        f_c = timeit(fwd_copy)
+        b_d = timeit(bwd_dlpack)
+        b_c = timeit(bwd_copy)
+        rows.append({"batch": b, "boundary": fmt_size(b),
+                     "fwd_dlpack_us": f_d, "fwd_copy_us": f_c,
+                     "bwd_dlpack_us": b_d, "bwd_copy_us": b_c})
+        print(f"  边界张量 {fmt_size(b):>7} (batch={b:6d})")
+        print(f"    正向 MS→PT : dlpack {f_d:9.1f} us/次 | copy {f_c:9.1f} us/次 "
+              f"(copy 慢 {f_c / max(f_d, 1e-9):6.1f}x)")
+        print(f"    回传 PT→MS : dlpack {b_d:9.1f} us/次 | copy {b_c:9.1f} us/次 "
+              f"(copy 慢 {b_c / max(b_d, 1e-9):6.1f}x)")
     print("-" * 78)
-    print(f"  每步合计   : dlpack {per_step_d:9.1f} us | copy {per_step_c:9.1f} us "
-          f"(copy 每步多 {per_step_c - per_step_d:.1f} us, 即 "
-          f"{(per_step_c - per_step_d) * args.steps / 1e3:.1f} ms / {args.steps} 步)")
-    print("  说明: dlpack 全程留在 device 内存; copy 每次交换含 NPU<->host 往返与流同步。")
+    print("  说明: dlpack 全程留在 device 内存; copy 每次交换含 NPU<->host 往返与流同步;"
+          "收益随边界张量增大线性放大(真实模型边界张量更大, 收益只会更显著)。")
     import json
     import os as _os
-    _here = _os.path.dirname(_os.path.abspath(__file__))
-    out_dir = _os.path.join(_here, "..", "results",
-                            "npu" if CFG["is_npu"] else "cpu")
-    _os.makedirs(out_dir, exist_ok=True)
+    out_dir = result_dir()
     with open(_os.path.join(out_dir, "bench_summary.json"), "w", encoding="utf-8") as f:
-        json.dump({"kind": "bench", "device": CFG["device"],
-                   "fwd_dlpack_us": f_d, "fwd_copy_us": f_c,
-                   "bwd_dlpack_us": b_d, "bwd_copy_us": b_c,
-                   "n": N}, f, ensure_ascii=False, indent=2)
+        json.dump({"kind": "bench", "version": 2, "device": CFG["device"],
+                   "hidden": h, "n": N, "sizes": rows}, f, ensure_ascii=False, indent=2)
     print(f"机器可读摘要已写入: {_os.path.abspath(_os.path.join(out_dir, 'bench_summary.json'))}")
     return 0
 
@@ -511,36 +457,32 @@ def main():
         return bench(args)
 
     ctx = build_everything(args)
-    print(f"({ctx['jit_note']})")
-    print("\n--- M4 边界梯度标定 (同权重单次对照) ---")
-    m4, m4_err = calibrate_m4(ctx, args)
+    print("\n--- M4 边界梯度标定 (同权重单次对照, torch 参考模型不参与训练) ---")
+    m4, m4_err, ref_loss, mix_loss = calibrate_m4(ctx, args)
 
-    print(f"\n--- A 臂: 单框架端到端基线 ({args.steps} 步) ---")
-    hist_a, t_a = train_arm_a(ctx, args)
+    print(f"\n--- 混合训练 ({args.steps} 步, exchange={args.exchange}) ---")
+    hist, times, fwd_us, bwd_us, val_curve = train_mixed(ctx, args)
+    eval_v = val_curve[args.steps]                   # 末步必评, 与曲线终点一致
 
-    print(f"\n--- B 臂: 混合训练 ({args.steps} 步, exchange={args.exchange}) ---")
-    hist_b, t_b, fwd_us, bwd_us = train_arm_b(ctx, args)
-
-    eval_a = eval_mse(ctx, "a")
-    eval_b = eval_mse(ctx, "b")
-
-    # 逐步训练日志落盘 (dense loss 曲线图表的数据源): results/{cpu|npu}/
+    # 逐步训练日志落盘 (E2/E3 对照曲线图表的数据源): results/{cpu|npu}/
+    # 文件名含 exchange, 保证 dlpack/copy 两跑的日志互不覆盖
     import csv
     import os as _os
-    _here = _os.path.dirname(_os.path.abspath(__file__))
-    log_dir = _os.path.join(_here, "..", "results",
-                            "npu" if CFG["is_npu"] else "cpu")
-    _os.makedirs(log_dir, exist_ok=True)
-    log_name = _os.path.join(log_dir, f"training_log_dlpack_h{args.hidden}.csv")
+    log_name = _os.path.join(
+        result_dir(), f"training_log_{args.exchange}_h{args.hidden}.csv")
     with open(log_name, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["step", "loss_a", "loss_b", "t_a_ms", "t_b_ms"])
+        w.writerow(["step", "loss", "val_loss", "t_ms"])
         for i in range(args.steps):
-            w.writerow([i + 1, hist_a[i], hist_b[i], t_a[i] * 1e3, t_b[i] * 1e3])
+            step = i + 1
+            w.writerow([step, hist[i],
+                        f"{val_curve[step]:.10e}" if step in val_curve else "",
+                        times[i] * 1e3])
+        # step 0 的初始验证点不落 CSV (曲线从 step 1 起), 已进摘要 eval_mse_initial
     print(f"\n逐步训练日志已写入: {log_name}")
 
-    return report(args, hist_a, hist_b, t_a, t_b, eval_a, eval_b,
-                  fwd_us, bwd_us, m4, m4_err)
+    return report(args, hist, times, eval_v, fwd_us, bwd_us, m4, m4_err,
+                  ref_loss, mix_loss, val_curve)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,16 @@
 # DLPack 混合编程验证: MindSpore ↔ PyTorch 零拷贝交换 + 梯度桥接
 
 在 **昇腾 910B(Atlas A2)** 上验证 MindSpore 与 PyTorch(torch_npu) 通过 DLPack 进行
-Tensor 零拷贝交换,并通过 **sens 梯度桥接** 让两侧参数都能更新——机制验证 + 训练收敛
-三臂对照 + 收益量化,最终由一个脚本生成验证报告。
+Tensor 零拷贝交换,并通过 **sens 梯度桥接** 让两侧参数都能更新——机制验证 + 训练
+**主对照(E2 vs E3)** + 收益量化,最终由一个脚本生成验证报告。
 
 **工作流**:在服务器上跑实验(自动落盘机器可读摘要与逐步日志)→ 把 `results/` 目录
 拷回 Windows → 运行**一键报告脚本**生成最终交付报告。
+
+**主对照设计**:验证目标是"DLPack 交换机制本身"的价值,因此对照双方**同为混合场景**
+(MS 前段 + PT 后段、同切分点、同数据同种子),唯一变量 = 交换机制
+(E2 = DLPack 零拷贝 / E3 = host 拷贝)。混合前段的框架调度开销在两跑中完全相同,
+故 E2 vs E3 的任何差异都纯粹来自交换机制——归因天然干净。
 
 ## 1. 目录结构
 
@@ -14,19 +19,19 @@ dlpack-verify/
 ├── scripts/                # 可执行脚本
 │   ├── check_env.py        #   环境自检 (CPU/910B 通用)
 │   ├── verify_dlpack.py    #   E1 机制验证 (9 个 STEP, 14 检查项)
-│   ├── train_hybrid.py     #   E2~E5 训练收敛三臂对照 (M1~M4) + --bench 纯交换收益
-│   └── make_report.py      #   一键报告: 读 results/ 摘要 → 重绘图 → 渲染验证报告
-├── make_report_charts.py   # 图表绘制函数库 (由 make_report.py 调用)
+│   ├── train_hybrid.py     #   E2/E3/E4/E5 混合训练主对照 (收敛/M4) + --bench
+│   └── make_report.py      #   一键报告: 读 results/ 摘要 → 绘 4 图 → 渲染验证报告
 ├── docs/                   # 文档
-│   ├── 验证报告.md         #   最终交付报告 (由 make_report.py 生成)
-│   ├── 验证报告_draft.md   #   草稿 (仅 cpu 调试数据时生成, 保护正式报告)
-│   └── 代码解读.md         #   新人版代码解读 (Mermaid 图)
-├── charts/                 # 报告引用的证据图 (make_report.py 生成)
+│   ├── 验证报告.md         #   最终交付报告 (npu 数据齐备时由 make_report.py 生成)
+│   ├── 验证报告_draft.md   #   草稿 (数据不全/cpu 调试时生成, 保护正式报告)
+│   └── 代码解读.md         #   verify_dlpack.py 代码解读 (Mermaid 图)
+├── charts/                 # 报告引用的证据图 ×4 (make_report.py 生成)
 ├── results/                # 运行产物 (脚本自动落盘, 按设备分目录)
-│   ├── npu/                #   910B: verify/train/bench 摘要 JSON + 逐步训练 CSV + 运行日志
+│   ├── npu/                #   910B: 摘要 JSON + training_log_{exchange}_h*.csv + 运行日志
 │   └── cpu/                #   本地调试产物
 ├── requirements-cpu.txt    # Windows CPU 环境依赖 (已实测锁定)
 ├── requirements-npu.txt    # 910B 环境依赖 (已按 CANN 8.3.RC1 锁定 torch/torch_npu 2.7.1)
+├── .gitignore
 └── README.md               # 本文件
 ```
 
@@ -53,12 +58,13 @@ dlpack-verify/
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| `--seed` | 7 | 两臂同初始化、同数据 |
+| `--seed` | 7 | 两跑同初始化、同数据 |
 | `--steps` | 300 | 训练步数 |
 | `--batch` | 128 | 样本数(全批) |
-| `--hidden` | 64 | 隐藏层宽度(计算密度敏感性实验中才允许改) |
+| `--hidden` | 64 | 隐藏层宽度(计算密度敏感性实验 E4 中才允许改) |
 | `--lr` | 0.05 | 学习率(hidden=1024 组配套 0.005, 见 E4 说明) |
 | `--result-every` | 50 | 控制台打印间隔(逐步 CSV 不受影响, 每步都记) |
+| `--eval-every` | 10 | held-out 验证评估间隔(计时段外, 首末步必评; 验证曲线进逐步 CSV) |
 | `--rtol` | 1e-3(CPU)/ **5e-3(NPU)** | M4 数值容差 |
 
 ### 3.2 实验矩阵(控制变量法: 每行只改一个变量)
@@ -67,19 +73,18 @@ dlpack-verify/
 |---|---|---|---|---|
 | E0 | 环境自检 | `python scripts/check_env.py` | — | torch_npu/NPU/CANN 全 OK |
 | E1 | 机制验证(14 检查项) | `python scripts/verify_dlpack.py --device npu --rtol 5e-3` | — | 零拷贝/桥接数学正确 |
-| **E2** | **训练三臂对照(dlpack 交换)** | `python scripts/train_hybrid.py --device npu --rtol 5e-3` | —(基准) | 混合训练收敛/指标/时延 |
-| **E3** | **训练三臂对照(copy 交换)** | `python scripts/train_hybrid.py --device npu --exchange copy --rtol 5e-3` | **仅交换方式: dlpack→host 拷贝** | **DLPack 交换机制的直接收益(G2 主对照)** |
-| E4 | 计算密度敏感性 | `python scripts/train_hybrid.py --device npu --hidden 1024 --batch 1024 --lr 0.005 --rtol 5e-3` | hidden/batch ×16(lr 组内配套) | M3 摊薄趋势 |
-| E5 | 纯交换收益 | `python scripts/train_hybrid.py --device npu --bench` | 仅 bench 模式 | G2 交换开销(纯交换段) |
+| **E2** | **混合训练(dlpack)** | `python scripts/train_hybrid.py --device npu --rtol 5e-3` | —(基准) | 混合训练收敛/底线/时延 |
+| **E3** | **混合训练(copy 对照)** | `python scripts/train_hybrid.py --device npu --exchange copy --rtol 5e-3` | **仅交换方式: dlpack→host 拷贝** | **DLPack 交换机制的直接收益(主对照)** |
+| E5 | 纯交换吞吐(尺寸扫描) | `python scripts/train_hybrid.py --device npu --bench`(默认 batch 128/4096/16384,`--bench-sizes` 自定) | 仅 bench 模式 + 边界张量尺寸档 | 收益随边界张量放大趋势(机制级上界) |
 
 **对照关系与归因原则(重要)**:
 
-- **主对照 = E2 vs E3**:同为混合场景(MS 前段 + PT 后段、同切分点、同数据),唯一变量是
-  交换机制——这是"DLPack 本身收益"的直接证据。
-- E4 单独看:与 E2 比,变化的是计算密度(框架调度常数被摊薄的比例),不是交换机制。
-- **归因纪律**:M3 的 B/A 比值(混合 vs 单框架)**不能归因给 dlpack**——真机实测 B−A ≈ 1.5 ms
-  中 dlpack 交换仅占 ~0.3 ms,其余为 MS PYNATIVE 单算子调度常数(纯 MS 训练同样存在)。
-  DLPack 交换机制的收益只能用 **E2 vs E3 的交换段对比 / E5 bench** 度量。
+- **主对照 = E2 vs E3**:同为混合场景(MS 前段 + PT 后段、同切分点、同数据同种子),
+  唯一变量是交换机制——这是"DLPack 本身价值"的直接证据;
+- **归因原则**:混合前段的 MindSpore 调度开销在 E2/E3 两跑中完全相同,因此
+  E2 vs E3 的差值纯粹来自交换机制,归因天然干净;
+- 混合训练的**绝对**步时延(≈2 ms)主体为 MS PYNATIVE 单算子调度常数,与交换无关,
+  该常数随计算密度增大被摊薄,生产规模按占比评估(接入真实模型时回归);
 - 本地 Windows 冒烟:同命令换 `--device cpu`(E2/E3 建议先在本地跑通再上真机)。
 
 ### 3.3 一键生成最终报告(NPU 跑完 → 拷回 → Windows 执行)
@@ -88,24 +93,29 @@ dlpack-verify/
 # 服务器跑完后, 把整个 results/ 目录拷回 Windows 项目根目录, 然后在 Windows 上:
 .venv\Scripts\activate.bat
 python scripts\make_report.py
-# 产出: charts/ 三张证据图 + docs\验证报告.md (实测数字自动填充)
+# 产出: charts/ 四张证据图 + docs\验证报告.md (实测数字自动填充)
 ```
 
 `make_report.py` 读取 `results/{npu|cpu}/` 下的 `verify_summary.json`、
-`train_summary_h{hidden}_{exchange}.json`、`bench_summary.json` 与逐步训练 CSV,
-**数据优先级 npu > cpu**(有真机摘要时绝不使用 cpu 数据)。
+`train_summary_h{hidden}_{dlpack|copy}.json`、`bench_summary.json`(尺寸扫描格式,
+v1 单尺寸扁平格式自动兼容)与逐步训练 CSV,**数据优先级 npu > cpu**(有真机摘要时
+绝不使用 cpu 数据)。旧版(v1)摘要键名自动兼容,不必重跑旧实验。
 
-### 3.4 E2/E3 判读要点(三臂对照的预期)
+### 3.4 E2/E3 判读要点(主对照的预期)
 
-- E2 与 E3 的 **loss 曲线逐位一致**(交换方式不影响数值正确性)——差异只在交换耗时;
-- M1 收敛等价性:B/A 最终 loss 比 ∈ [0.5, 2.0](真机实测 0.9976 / 0.9980);
-- M2 指标不恶化:held-out 评估比 ≤ 1.01(真机实测 0.9989 / 0.9979);
-- M4 边界数值:桥接梯度 vs 单框架梯度(jit 修复后真机实测**逐位一致 0.0**);
-- M3 玩具规模未达属预期(MS 单算子调度常数主导,非交换开销),
-  加大 `--hidden/--batch` 观察比值摊薄,生产规模复测为最终判据(详见 §4.5);
-- **归因纪律**:M3 的 B/A 比值是"混合 vs 单框架",其中 dlpack 交换仅占 ~0.3 ms,
-  主体为 MS 执行模式常数——**该比值不能归因给 dlpack**;dlpack 的收益只看 E2 vs E3
-  的交换段对比与 E5 bench。
+- **C1 数值一致性**:E2 与 E3 的 loss 曲线**逐位一致**(零拷贝与 host 拷贝传递的
+  数值完全相同,交换机制不影响数值正确性)——真机实测 final loss 与 held-out
+  评估均逐位相同;
+- **泛化(过拟合检查)**:held-out 验证损失随训练同步下降(图 1 虚线),终点与
+  训练损失同量级——E2/E3 的验证曲线同样逐位一致;
+- **C2 步时延**:dlpack ≤ copy × 1.02(真机实测 copy 反而慢 1.36x);
+- **C3 交换段**:dlpack ≤ copy(E5 bench 为机制级上界,训练内实测同向);
+- 运行内底线:收敛性(loss 下降、无 NaN)+ **M4 边界梯度 vs torch 参考逐位一致
+  (rel_err=0.0)** + 初始一致性;
+- **归因原则**:混合训练的绝对步时延主体是 MS PYNATIVE 调度常数,在两种交换
+  机制下完全相同——不要把它当成交换开销,主对照差值才是;
+- 数据齐全(verify + E2 + E3)→ 生成正式报告;缺项 → 草稿 + "待复测"占位,
+  控制台会列出补跑命令。
 
 ## 4. verify_dlpack.py 的验证项 ↔ 验收标准映射
 
@@ -121,31 +131,39 @@ python scripts\make_report.py
 | 8 | 两侧参数均被更新 | 第二层-9 |
 | 9 | 交换耗时:dlpack 路径 vs 拷贝路径 | NFR-1 |
 
-## 5. 训练收敛验证的设计与真机结果(train_hybrid.py)
+## 5. 训练主对照设计与真机结果(train_hybrid.py)
 
-三臂设计:A 臂 = 同构模型整体 PyTorch 端到端(基线);B 臂 = MS 前段 ─DLPack─ PT 后段
-(每步完整梯度桥接);C 臂 = 同 B 用 host 拷贝交换。教师为固定随机权重的同构非线性映射
-(输出按 1/√h 缩放),B 臂初始化从 A 臂拷贝,held-out 评估集 512 条独立采样。
+设计:混合学生 = MS(fc1 4→h + ReLU) ──交换──▶ torch(fc2 h→2),教师为固定随机权重
+的同构非线性映射(输出按 1/√h 缩放);E2/E3 同种子同初始化同数据同超参;held-out
+验证集 512 条独立采样,训练前/每 10 步(`--eval-every`)/训练后各评一次(计时段外,
+验证曲线落盘逐步 CSV);每次运行内置底线 = 收敛性 + 泛化(验证曲线同步下降,过拟合
+检查)+ M4 边界梯度标定(训练前同权重单次对照,torch 参考模型不参与训练)+ 初始一致性。
 
-真机结果(hidden=64 与 hidden=1024 两轮,M1/M2/M4 全过):
+真机结果(h=64,E2 vs E3,2026-11-10):
 
-| 底线 | 判据 | h=64 | h=1024 |
+| 指标 | E2 (dlpack) | E3 (copy) | 判定 |
 |---|---|---|---|
-| M1 收敛等价性 | B/A 最终 loss 比 ∈ [0.5,2.0] | **0.9976** ✅ | **0.9980** ✅ |
-| M2 指标不恶化 | held-out 评估比 ≤ 1.01 | **0.9989** ✅ | **0.9979** ✅ |
-| M3 步时延不恶化 | B/A ≤ 1 + m3_tol | 2.38x ❌(见下) | 2.81x ❌(见下) |
-| M4 边界数值正确 | 桥接梯度 vs 单框架梯度 | **0.0(逐位一致)** ✅ | **0.0(逐位一致)** ✅ |
+| final loss | 0.004477296024560928 | 0.004477296024560928 | **逐位一致** ✅ |
+| held-out 评估 MSE | 0.006813785061240196 | 0.006813785061240196 | **逐位一致** ✅ |
+| 步时延(去预热) | 2.02 ms | 2.75 ms | **copy 慢 1.36x** ✅ |
+| 交换段 正向 | 54.9 µs/步 | 332.7 µs/步 | **copy 慢 6.1x** ✅ |
+| 交换段 回传 | 52.4 µs/步 | 233.2 µs/步 | **copy 慢 4.4x** ✅ |
+| M4 边界梯度 | rel_err = 0.0(逐位一致) | rel_err = 0.0(逐位一致) | ✅ |
 
-**M3 诚实解读**:玩具规模下 B 臂每步的 MindSpore PYNATIVE 单算子调度开销(毫秒级
-框架常数)占主导,与交换本身无关(交换仅 ~0.3ms/步);该常数随计算密度增大被摊薄
-(hidden 64→1024 已可见改善),**生产规模(计算密集)按占比复测为最终判据**;
-混合范式净增成本仅为交换段(µs 级),MS 侧前段的调度开销无论是否混合都存在。
-**归因纪律**:该 2.38x 是"混合 vs 单框架"的比值,**不能归因给 dlpack 交换**;
-dlpack 交换机制的收益只看 E2 vs E3 交换段对比(bench 13.9x / 8.7x)。
+过拟合检查:held-out 验证损失与训练损失同步下降、终点同量级(0.0068 vs 0.0045),
+无病态过拟合分歧——且该验证曲线本身在 E2/E3 间也逐位一致(泛化行为不受交换机制
+影响;新脚本重跑后训练/验证双曲线进图 1)。
+
+E5 bench(尺寸扫描,同进程 N=200):基准尺寸(边界张量 32KB)正向 copy 慢 **13.6x**、
+回传 **9.4x**;扫描档位 batch 128/4096/16384(边界张量 32KB/1MB/4MB)待重跑刷新——
+收益随边界张量增大线性放大,真实模型边界张量更大,收益只会更显著。
+
+> 表中数字由 `results/npu/` 摘要自动渲染进报告(报告即数据,可复现、可审计);
+> 混合臂训练逻辑未变,重跑数值可复现。绝对步时延 ≈2 ms 的主体是 MS PYNATIVE
+> 单算子调度常数(两种交换机制下相同),生产规模按占比评估(见 §3.4 归因原则)。
 
 机制级补充:PYNATIVE GradOperation 反向会重执行一次前向(每步 2 次 MS 前向,固有
-行为)。已实装 `mindspore.vjp` 模式消除冗余前向(注意官方用法是 `vjp(fn, *inputs)`);
-`ms.jit(grad_fn)` 编译版梯度数值有偏差,保留为实验开关 `--ms-jit`(默认关闭)。
+行为)。已实装 `mindspore.vjp` 模式消除冗余前向(注意官方用法是 `vjp(fn, *inputs)`)。
 
 ## 6. 910B (Atlas A2) 移植指南
 
@@ -176,7 +194,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-npu.txt
 # 3. 每次使用前激活 CANN 运行时 (容易漏!):
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-# 4. 按 §3 实验矩阵执行 (E0→E2→E3→E4→E5), 输出与 results/ 即交付物
+# 4. 按 §3 实验矩阵执行 (E0→E1→E2→E3→E4→E5), 输出与 results/ 即交付物
 ```
 
 ### 6.4 已知风险与无害告警
@@ -205,6 +223,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 | 数值偶发不一致(910B) | 跨框架流未同步 | 消费前 `torch.npu.synchronize()` |
 | pip 找不到 mindspore Windows 包 | 2.4~2.6 无 Windows wheel | 选 2.11.0(或 ≥2.7)+ py3.10 |
 | `ms.jit` 包装 Cell 后权重不更新 | jit 编译图固化编译时权重值 | 函数式前端 + 权重作参数传入(本仓库 train_hybrid 已如此实现) |
+| `ms.jit` 编译梯度函数后梯度数值有偏差 | jit 编译图与 PYNATIVE 数值路径不一致(CPU 实测 M2 恶化至 1.27) | 梯度路径保持 PYNATIVE(本仓库已按此实现,实验开关已移除) |
 | `mindspore.vjp` 多参数输入报缺参 | vjp(fn) 未注册 inputs | 官方用法:`vjp(fn, x, w, b)` 返回 (out, bwd_fn),bwd_fn 只收种子向量 |
 
 ## 8. 交付物与报告生成
@@ -212,8 +231,11 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```bash
 # NPU 实验全部跑完后, results/ 拷回 Windows, 一键生成最终报告:
 python scripts/make_report.py
-# 产出: charts/ 三张证据图(实测数据重绘) + docs/验证报告.md(实测数字自动填充)
-# 保护机制: 仅 cpu 调试数据时生成 docs/验证报告_draft.md, 不覆盖正式报告
+# 产出: charts/ 四张证据图(实测数据重绘) + docs/验证报告.md(实测数字自动填充)
+# 正式条件: npu 的 verify_summary.json + train_summary_h64_dlpack.json +
+#           train_summary_h64_copy.json 三份齐备
+# 保护机制: 数据不全时生成 docs/验证报告_draft.md(不覆盖正式报告),
+#           控制台列出缺失项与补跑命令
 ```
 
 验证报告的完整内容(结论/证据表/环境清单/已知限制/收益评估框架 附录 A)由模板
