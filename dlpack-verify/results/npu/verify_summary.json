@@ -1,0 +1,111 @@
+{
+  "kind": "verify_dlpack",
+  "device": "npu:0",
+  "env": {
+    "python": "3.10.21",
+    "numpy": "1.26.4",
+    "torch": "2.7.1+cpu",
+    "mindspore": "2.10.0",
+    "device": "npu:0"
+  },
+  "n_pass": 14,
+  "n_total": 14,
+  "checks": [
+    {
+      "step": 1,
+      "name": "MS→PT 交换",
+      "ok": true,
+      "detail": "shape=(2, 2) dtype=torch.float32 device=cpu"
+    },
+    {
+      "step": 2,
+      "name": "PT→MS 交换",
+      "ok": true,
+      "detail": "shape=(2, 2) dtype=Float32"
+    },
+    {
+      "step": 3,
+      "name": "MS→PT 零拷贝 (torch.fill_ 后 MS 侧同步)",
+      "ok": true,
+      "detail": "MS 侧读回=[[7.0, 7.0], [7.0, 7.0]]"
+    },
+    {
+      "step": 3,
+      "name": "PT→MS 零拷贝 (torch.add_ 后 MS 侧同步)",
+      "ok": true,
+      "detail": "MS 侧读回=[[4.0, 4.0], [4.0, 4.0]]"
+    },
+    {
+      "step": 4,
+      "name": "pt_input.grad 非空",
+      "ok": true,
+      "detail": "grad shape=(1, 4)"
+    },
+    {
+      "step": 4,
+      "name": "pt_head 参数梯度非空",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "step": 5,
+      "name": "MS 参数梯度非空 (sens_param=True)",
+      "ok": true,
+      "detail": "fc.weight:(4, 4) | fc.bias:(4,)"
+    },
+    {
+      "step": 6,
+      "name": "两框架前向 loss 一致",
+      "ok": true,
+      "detail": "torch=0.22105893 vs 解析=0.22105896"
+    },
+    {
+      "step": 6,
+      "name": "pt_input.grad == 解析解 d(loss)/d(ms_out)",
+      "ok": true,
+      "detail": "rel_err=6.970e-08"
+    },
+    {
+      "step": 6,
+      "name": "MS weight 梯度 == 解析解 d(loss)/dW1",
+      "ok": true,
+      "detail": "rel_err=1.423e-07"
+    },
+    {
+      "step": 6,
+      "name": "MS bias 梯度 == 解析解 d(loss)/db1",
+      "ok": true,
+      "detail": "rel_err=6.970e-08"
+    },
+    {
+      "step": 7,
+      "name": "假 sens 梯度 ≠ 真实桥接梯度",
+      "ok": true,
+      "detail": "max|ΔW|=1.515e+00"
+    },
+    {
+      "step": 8,
+      "name": "PyTorch 参数已更新",
+      "ok": true,
+      "detail": "max|Δw|=1.120e-04"
+    },
+    {
+      "step": 8,
+      "name": "MindSpore 参数已更新",
+      "ok": true,
+      "detail": "max|Δw|=4.030e-03"
+    }
+  ],
+  "meas": {
+    "loss_torch": 0.2210589349269867,
+    "loss_ref": 0.22105896189128796,
+    "rel_grad_pt": 6.969550453464569e-08,
+    "rel_grad_w": 1.422683563150558e-07,
+    "rel_grad_b": 6.969550453464569e-08,
+    "negctrl_diff_w": 1.5149103701114655,
+    "pt_moved": 0.00011196732521057129,
+    "ms_moved": 0.004030303098261356,
+    "t_dlpack_us": 13.792365789413452,
+    "t_copy_us": 31.15333616733551
+  }
+}

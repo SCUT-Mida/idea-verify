@@ -336,7 +336,7 @@ def eval_mse(ctx, which):
 # ---------------------------------------------------------------------------
 # 报告: M1~M4 判定
 # ---------------------------------------------------------------------------
-def report(args, hist_a, hist_b, t_a, t_b, eval_a, eval_b, fwd_us, bwd_us, m4):
+def report(args, hist_a, hist_b, t_a, t_b, eval_a, eval_b, fwd_us, bwd_us, m4, m4_err):
     hist_a, hist_b = np.array(hist_a), np.array(hist_b)
     if not (np.isfinite(hist_a).all() and np.isfinite(hist_b).all()):
         print("[FATAL] 训练发散 (出现 NaN/Inf): 请降低 --lr 或减小 --hidden 后重试")
@@ -394,6 +394,37 @@ def report(args, hist_a, hist_b, t_a, t_b, eval_a, eval_b, fwd_us, bwd_us, m4):
                   "(与本验证 small-nets 无关的框架常数); 生产规模(计算密集)按占比复测, "
                   "可用 --hidden/--batch 加大计算密度观察比值收敛。")
         print(f"  结论: {'全部' if ok else '部分'}底线达成。")
+    import json
+    import os as _os
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    out_dir = _os.path.join(_here, "..", "results",
+                            "npu" if CFG["is_npu"] else "cpu")
+    _os.makedirs(out_dir, exist_ok=True)
+    summary = {
+        "kind": "train_hybrid", "device": CFG["device"],
+        "hidden": args.hidden, "batch": args.batch, "lr": args.lr,
+        "steps": args.steps, "seed": args.seed, "exchange": args.exchange,
+        "rtol": args.rtol, "m3_tol": args.m3_tol,
+        "results": {
+            "initial_loss_a": float(hist_a[0]), "initial_loss_b": float(hist_b[0]),
+            "final_loss_a": float(hist_a[-1]), "final_loss_b": float(hist_b[-1]),
+            "ratio_final": float(final_ratio),
+            "eval_a": float(eval_a), "eval_b": float(eval_b),
+            "eval_ratio": float(eval_ratio),
+            "lat_a_ms": float(np.mean(t_a) * 1e3),
+            "lat_b_ms": float(np.mean(t_b) * 1e3),
+            "lat_ratio": float(lat_ratio),
+            "curve_dev_decades": curve_dev, "auc_dev_decades": auc_dev,
+            "exchange_fwd_us": float(fwd_us), "exchange_bwd_us": float(bwd_us),
+            "m1": bool(m1), "m2": bool(m2), "m3": bool(m3), "m4": bool(m4)},
+        "m4_calibration": {"rel_err": float(m4_err), "rtol": args.rtol,
+                            "pass": bool(m4)},
+        "initial_consistency_dev": float(init_dev),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    sname = f"train_summary_h{args.hidden}_{args.exchange}.json"
+    with open(_os.path.join(out_dir, sname), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"机器可读摘要已写入: {_os.path.abspath(_os.path.join(out_dir, sname))}")
     return 0 if ok else 1
 
 
@@ -458,6 +489,18 @@ def bench(args):
           f"(copy 每步多 {per_step_c - per_step_d:.1f} us, 即 "
           f"{(per_step_c - per_step_d) * args.steps / 1e3:.1f} ms / {args.steps} 步)")
     print("  说明: dlpack 全程留在 device 内存; copy 每次交换含 NPU<->host 往返与流同步。")
+    import json
+    import os as _os
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    out_dir = _os.path.join(_here, "..", "results",
+                            "npu" if CFG["is_npu"] else "cpu")
+    _os.makedirs(out_dir, exist_ok=True)
+    with open(_os.path.join(out_dir, "bench_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"kind": "bench", "device": CFG["device"],
+                   "fwd_dlpack_us": f_d, "fwd_copy_us": f_c,
+                   "bwd_dlpack_us": b_d, "bwd_copy_us": b_c,
+                   "n": N}, f, ensure_ascii=False, indent=2)
+    print(f"机器可读摘要已写入: {_os.path.abspath(_os.path.join(out_dir, 'bench_summary.json'))}")
     return 0
 
 
@@ -470,7 +513,7 @@ def main():
     ctx = build_everything(args)
     print(f"({ctx['jit_note']})")
     print("\n--- M4 边界梯度标定 (同权重单次对照) ---")
-    m4, _ = calibrate_m4(ctx, args)
+    m4, m4_err = calibrate_m4(ctx, args)
 
     print(f"\n--- A 臂: 单框架端到端基线 ({args.steps} 步) ---")
     hist_a, t_a = train_arm_a(ctx, args)
@@ -497,7 +540,7 @@ def main():
     print(f"\n逐步训练日志已写入: {log_name}")
 
     return report(args, hist_a, hist_b, t_a, t_b, eval_a, eval_b,
-                  fwd_us, bwd_us, m4)
+                  fwd_us, bwd_us, m4, m4_err)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,254 @@
+(.venv) [mindspore@cloud-862058a9-b2dc-4496-a9db-5eb7b89c9445-867475669c-7zv5f work]$ python scripts/check_env.py
+==============================================================================
+DLPack 验证环境自检
+==============================================================================
+------------------------------------------------------------------------------
+冒烟测试 (smoke test):
+  [OK]  MindSpore -> to_dlpack  capsule 导出成功: <class 'PyCapsule'>
+  [OK]  MindSpore -> PyTorch  from_dlpack 成功: shape=(2, 3), device=cpu, dtype=torch.float32
+  [OK]  PyTorch -> MindSpore from_dlpack 成功: shape=(2, 3), dtype=Float32
+==============================================================================
+[OK]   Python                       3.10.21
+[OK]   平台                           Linux-5.10.0-60.18.0.50.r865_35.hce2.aarch64-aarch64-with-glibc2.38
+[OK]   numpy                        1.26.4
+[OK]   PyTorch                      2.7.1+cpu
+[OK]   torch_npu                    2.7.1  NPU设备数=1
+[OK]   MindSpore                    2.10.0
+[OK]   mindspore.utils.dlpack       to_dlpack=True, from_dlpack=True
+[OK]   torch.utils.dlpack           to_dlpack/from_dlpack 均存在
+[OK]   CANN/npu-smi                 +-----------------------------------------------------------
+==============================================================================
+结论: 环境齐备, 可以开始 DLPack 验证。(标注 [OPT] 的项为当前平台可选)
+(.venv) [mindspore@cloud-862058a9-b2dc-4496-a9db-5eb7b89c9445-867475669c-7zv5f work]$ python scripts/verify_dlpack.py --device npu --rtol 5e-3
+==============================================================================
+DLPack 验证  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  mode=PYNATIVE
+==============================================================================
+
+--- STEP 1/2: 双向基础交换 (dtype/shape/设备) ---
+  [PASS] STEP 1  MS→PT 交换  -- shape=(2, 2) dtype=torch.float32 device=cpu
+  [PASS] STEP 2  PT→MS 交换  -- shape=(2, 2) dtype=Float32
+
+--- STEP 3: 零拷贝语义验证 ---
+  [PASS] STEP 3  MS→PT 零拷贝 (torch.fill_ 后 MS 侧同步)  -- MS 侧读回=[[7.0, 7.0], [7.0, 7.0]]
+  [PASS] STEP 3  PT→MS 零拷贝 (torch.add_ 后 MS 侧同步)  -- MS 侧读回=[[4.0, 4.0], [4.0, 4.0]]
+
+--- STEP 4: PyTorch 局部计算图 (DLPack 叶子重建) ---
+  [PASS] STEP 4  pt_input.grad 非空  -- grad shape=(1, 4)
+  [PASS] STEP 4  pt_head 参数梯度非空
+
+--- STEP 5: 梯度桥接 (pt_input.grad → MS sens) ---
+  [PASS] STEP 5  MS 参数梯度非空 (sens_param=True)  -- fc.weight:(4, 4) | fc.bias:(4,)
+
+--- STEP 6: 数值正确性 (float64 解析解对照) ---
+  [PASS] STEP 6  两框架前向 loss 一致  -- torch=0.22105893 vs 解析=0.22105896
+  [PASS] STEP 6  pt_input.grad == 解析解 d(loss)/d(ms_out)  -- rel_err=6.970e-08
+  [PASS] STEP 6  MS weight 梯度 == 解析解 d(loss)/dW1  -- rel_err=1.423e-07
+  [PASS] STEP 6  MS bias 梯度 == 解析解 d(loss)/db1  -- rel_err=6.970e-08
+
+--- STEP 7: 负对照 (ones_like 假 sens 应产生不同梯度) ---
+  [PASS] STEP 7  假 sens 梯度 ≠ 真实桥接梯度  -- max|ΔW|=1.515e+00
+
+--- STEP 8: 两侧参数更新 ---
+  [PASS] STEP 8  PyTorch 参数已更新  -- max|Δw|=1.120e-04
+  [PASS] STEP 8  MindSpore 参数已更新  -- max|Δw|=4.030e-03
+
+--- STEP 9: 交换耗时统计 (100 次均值) ---
+  dlpack 交换:     13.8 us/次   |  拷贝路径(asnumpy→torch):     31.2 us/次
+
+==============================================================================
+验证报告
+==============================================================================
+  [PASS] STEP 1  MS→PT 交换   (shape=(2, 2) dtype=torch.float32 device=cpu)
+  [PASS] STEP 2  PT→MS 交换   (shape=(2, 2) dtype=Float32)
+  [PASS] STEP 3  MS→PT 零拷贝 (torch.fill_ 后 MS 侧同步)   (MS 侧读回=[[7.0, 7.0], [7.0, 7.0]])
+  [PASS] STEP 3  PT→MS 零拷贝 (torch.add_ 后 MS 侧同步)   (MS 侧读回=[[4.0, 4.0], [4.0, 4.0]])
+  [PASS] STEP 4  pt_input.grad 非空   (grad shape=(1, 4))
+  [PASS] STEP 4  pt_head 参数梯度非空
+  [PASS] STEP 5  MS 参数梯度非空 (sens_param=True)   (fc.weight:(4, 4) | fc.bias:(4,))
+  [PASS] STEP 6  两框架前向 loss 一致   (torch=0.22105893 vs 解析=0.22105896)
+  [PASS] STEP 6  pt_input.grad == 解析解 d(loss)/d(ms_out)   (rel_err=6.970e-08)
+  [PASS] STEP 6  MS weight 梯度 == 解析解 d(loss)/dW1   (rel_err=1.423e-07)
+  [PASS] STEP 6  MS bias 梯度 == 解析解 d(loss)/db1   (rel_err=6.970e-08)
+  [PASS] STEP 7  假 sens 梯度 ≠ 真实桥接梯度   (max|ΔW|=1.515e+00)
+  [PASS] STEP 8  PyTorch 参数已更新   (max|Δw|=1.120e-04)
+  [PASS] STEP 8  MindSpore 参数已更新   (max|Δw|=4.030e-03)
+------------------------------------------------------------------------------
+合计: 14/14 PASS
+结论: 全部通过 — DLPack 交换/零拷贝/梯度桥接机制在该环境成立。
+机器可读摘要已写入: /home/mindspore/work/results/npu/verify_summary.json
+(.venv) [mindspore@cloud-862058a9-b2dc-4496-a9db-5eb7b89c9445-867475669c-7zv5f work]$ python scripts/train_hybrid.py --device npu --rtol 5e-3
+==============================================================================
+混合训练收敛 + 基线对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=64  batch=128  exchange=dlpack
+==============================================================================
+(MS 前向: vjp + PYNATIVE (--no-ms-jit))
+
+--- M4 边界梯度标定 (同权重单次对照) ---
+  [M4] 边界梯度标定: MS 桥接梯度 vs torch 单框架梯度  max_rel_err=0.000e+00 (rtol=0.005)  [PASS]
+
+--- A 臂: 单框架端到端基线 (300 步) ---
+  [A 臂] step     1  loss = 1.531153e-01
+  [A 臂] step    50  loss = 1.837008e-02
+  [A 臂] step   100  loss = 1.249019e-02
+  [A 臂] step   150  loss = 9.028116e-03
+  [A 臂] step   200  loss = 6.845919e-03
+  [A 臂] step   250  loss = 5.431500e-03
+  [A 臂] step   300  loss = 4.488275e-03
+
+--- B 臂: 混合训练 (300 步, exchange=dlpack) ---
+  [B 臂] step     1  loss = 1.531153e-01
+  [B 臂] step    50  loss = 1.824383e-02
+  [B 臂] step   100  loss = 1.242429e-02
+  [B 臂] step   150  loss = 8.990590e-03
+  [B 臂] step   200  loss = 6.822213e-03
+  [B 臂] step   250  loss = 5.416145e-03
+  [B 臂] step   300  loss = 4.477296e-03
+
+逐步训练日志已写入: /home/mindspore/work/scripts/../results/npu/training_log_dlpack_h64.csv
+
+==============================================================================
+训练收敛 + 基线对照 报告 (M1~M4 底线)
+------------------------------------------------------------------------------
+  loss 曲线: A 臂 1.531e-01 -> 4.488e-03 | B 臂 1.531e-01 -> 4.477e-03
+  held-out 评估 MSE : A 臂 6.821471e-03 | B 臂 6.813785e-03
+  步时延(去预热)    : A 臂 1.03 ms | B 臂 2.02 ms
+  交换开销(B 臂, 含算子同步): 正向 54.9 us/步, 回传 52.4 us/步
+------------------------------------------------------------------------------
+  [PASS] M1 收敛等价性  : 最终 loss 比 B/A = 0.9976 (∈[0.5,2.0]) 且两臂均收敛; 轨迹均值差 0.004 / 逐点最大 0.087 个数量级 (非线性下逐点会混沌放大, 仅参考)
+  [sanity] 初始 loss 一致性: |B0-A0|/A0 = 0.00e+00 (应 ≈ 0, 两臂同初始化)
+  [PASS] M2 指标不恶化  : B/A 评估比 0.9989 (≤1.01)
+  [FAIL] M3 步时延不恶化: B/A 比值 1.947 (≤1+0.02)
+  [PASS] M4 边界数值正确: 见上方标定输出
+------------------------------------------------------------------------------
+  说明: M3 未达时, 主体是玩具规模下 MindSpore PYNATIVE 单算子调度开销(与本验证 small-nets 无关的框架常数); 生产规模(计算密集)按占比复测, 可用 --hidden/--batch 加大计算密度观察比值收敛。
+  结论: 部分底线达成。
+机器可读摘要已写入: /home/mindspore/work/results/npu/train_summary_h64_dlpack.json
+(.venv) [mindspore@cloud-862058a9-b2dc-4496-a9db-5eb7b89c9445-867475669c-7zv5f work]$ python scripts/train_hybrid.py --device npu --exchange copy --rtol 5e-3
+==============================================================================
+混合训练收敛 + 基线对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=64  batch=128  exchange=copy
+==============================================================================
+(MS 前向: vjp + PYNATIVE (--no-ms-jit))
+
+--- M4 边界梯度标定 (同权重单次对照) ---
+  [M4] 边界梯度标定: MS 桥接梯度 vs torch 单框架梯度  max_rel_err=0.000e+00 (rtol=0.005)  [PASS]
+
+--- A 臂: 单框架端到端基线 (300 步) ---
+  [A 臂] step     1  loss = 1.531153e-01
+  [A 臂] step    50  loss = 1.837008e-02
+  [A 臂] step   100  loss = 1.249019e-02
+  [A 臂] step   150  loss = 9.028116e-03
+  [A 臂] step   200  loss = 6.845919e-03
+  [A 臂] step   250  loss = 5.431500e-03
+  [A 臂] step   300  loss = 4.488275e-03
+
+--- B 臂: 混合训练 (300 步, exchange=copy) ---
+  [B 臂] step     1  loss = 1.531153e-01
+  [B 臂] step    50  loss = 1.824383e-02
+  [B 臂] step   100  loss = 1.242429e-02
+  [B 臂] step   150  loss = 8.990590e-03
+  [B 臂] step   200  loss = 6.822213e-03
+  [B 臂] step   250  loss = 5.416145e-03
+  [B 臂] step   300  loss = 4.477296e-03
+
+逐步训练日志已写入: /home/mindspore/work/scripts/../results/npu/training_log_dlpack_h64.csv
+
+==============================================================================
+训练收敛 + 基线对照 报告 (M1~M4 底线)
+------------------------------------------------------------------------------
+  loss 曲线: A 臂 1.531e-01 -> 4.488e-03 | B 臂 1.531e-01 -> 4.477e-03
+  held-out 评估 MSE : A 臂 6.821471e-03 | B 臂 6.813785e-03
+  步时延(去预热)    : A 臂 1.00 ms | B 臂 2.75 ms
+------------------------------------------------------------------------------
+  [PASS] M1 收敛等价性  : 最终 loss 比 B/A = 0.9976 (∈[0.5,2.0]) 且两臂均收敛; 轨迹均值差 0.004 / 逐点最大 0.087 个数量级 (非线性下逐点会混沌放大, 仅参考)
+  [sanity] 初始 loss 一致性: |B0-A0|/A0 = 0.00e+00 (应 ≈ 0, 两臂同初始化)
+  [PASS] M2 指标不恶化  : B/A 评估比 0.9989 (≤1.01)
+  [FAIL] M3 步时延不恶化: B/A 比值 2.749 (≤1+0.02)
+  [PASS] M4 边界数值正确: 见上方标定输出
+------------------------------------------------------------------------------
+  说明: M3 未达时, 主体是玩具规模下 MindSpore PYNATIVE 单算子调度开销(与本验证 small-nets 无关的框架常数); 生产规模(计算密集)按占比复测, 可用 --hidden/--batch 加大计算密度观察比值收敛。
+  结论: 部分底线达成。
+机器可读摘要已写入: /home/mindspore/work/results/npu/train_summary_h64_copy.json
+(.venv) [mindspore@cloud-862058a9-b2dc-4496-a9db-5eb7b89c9445-867475669c-7zv5f work]$ python scripts/train_hybrid.py --device npu --hidden 1024 --batch 1024 --lr 0.005 --rtol 5e-3
+==============================================================================
+混合训练收敛 + 基线对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=1024  batch=1024  exchange=dlpack
+==============================================================================
+(MS 前向: vjp + PYNATIVE (--no-ms-jit))
+
+--- M4 边界梯度标定 (同权重单次对照) ---
+  [M4] 边界梯度标定: MS 桥接梯度 vs torch 单框架梯度  max_rel_err=0.000e+00 (rtol=0.005)  [PASS]
+
+--- A 臂: 单框架端到端基线 (300 步) ---
+  [A 臂] step     1  loss = 2.679930e-01
+  [A 臂] step    50  loss = 1.636368e-02
+  [A 臂] step   100  loss = 1.052756e-02
+  [A 臂] step   150  loss = 7.674805e-03
+  [A 臂] step   200  loss = 6.122353e-03
+  [A 臂] step   250  loss = 5.208739e-03
+  [A 臂] step   300  loss = 4.639633e-03
+
+--- B 臂: 混合训练 (300 步, exchange=dlpack) ---
+  [B 臂] step     1  loss = 2.679930e-01
+  [B 臂] step    50  loss = 1.619514e-02
+  [B 臂] step   100  loss = 1.044948e-02
+  [B 臂] step   150  loss = 7.634023e-03
+  [B 臂] step   200  loss = 6.099037e-03
+  [B 臂] step   250  loss = 5.194513e-03
+  [B 臂] step   300  loss = 4.630510e-03
+
+逐步训练日志已写入: /home/mindspore/work/scripts/../results/npu/training_log_dlpack_h1024.csv
+
+==============================================================================
+训练收敛 + 基线对照 报告 (M1~M4 底线)
+------------------------------------------------------------------------------
+  loss 曲线: A 臂 2.680e-01 -> 4.640e-03 | B 臂 2.680e-01 -> 4.631e-03
+  held-out 评估 MSE : A 臂 5.645277e-03 | B 臂 5.633698e-03
+  步时延(去预热)    : A 臂 1.07 ms | B 臂 2.53 ms
+  交换开销(B 臂, 含算子同步): 正向 55.2 us/步, 回传 470.7 us/步
+------------------------------------------------------------------------------
+  [PASS] M1 收敛等价性  : 最终 loss 比 B/A = 0.9980 (∈[0.5,2.0]) 且两臂均收敛; 轨迹均值差 0.006 / 逐点最大 0.133 个数量级 (非线性下逐点会混沌放大, 仅参考)
+  [sanity] 初始 loss 一致性: |B0-A0|/A0 = 0.00e+00 (应 ≈ 0, 两臂同初始化)
+  [PASS] M2 指标不恶化  : B/A 评估比 0.9979 (≤1.01)
+  [FAIL] M3 步时延不恶化: B/A 比值 2.372 (≤1+0.02)
+  [PASS] M4 边界数值正确: 见上方标定输出
+------------------------------------------------------------------------------
+  说明: M3 未达时, 主体是玩具规模下 MindSpore PYNATIVE 单算子调度开销(与本验证 small-nets 无关的框架常数); 生产规模(计算密集)按占比复测, 可用 --hidden/--batch 加大计算密度观察比值收敛。
+  结论: 部分底线达成。
+机器可读摘要已写入: /home/mindspore/work/results/npu/train_summary_h1024_dlpack.json
+(.venv) [mindspore@cloud-862058a9-b2dc-4496-a9db-5eb7b89c9445-867475669c-7zv5f work]$ python scripts/train_hybrid.py --device npu --bench
+==============================================================================
+混合训练收敛 + 基线对照  device=npu:0  device_target=Ascend
+numpy=1.26.4  torch=2.7.1+cpu  mindspore=2.10.0  hidden=64  batch=128  exchange=dlpack
+==============================================================================
+==============================================================================
+纯交换吞吐 microbenchmark  device=npu:0  数据 (128, 4) float32  N=200 (预热 10)
+------------------------------------------------------------------------------
+  正向 MS→PT : dlpack      14.3 us/次 | copy     194.9 us/次 (copy 慢 13.6x)
+  回传 PT→MS : dlpack      12.9 us/次 | copy     121.2 us/次 (copy 慢 9.4x)
+------------------------------------------------------------------------------
+  每步合计   : dlpack      27.2 us | copy     316.1 us (copy 每步多 288.9 us, 即 86.7 ms / 300 步)
+  说明: dlpack 全程留在 device 内存; copy 每次交换含 NPU<->host 往返与流同步。
+机器可读摘要已写入: /home/mindspore/work/results/npu/bench_summary.json
+(.venv) [mindspore@cloud-862058a9-b2dc-4496-a9db-5eb7b89c9445-867475669c-7zv5f work]$ ls -lrt
+total 648
+drwxr-xr-x 2 mindspore mindspore   4096  9月 28 13:17  images
+-rw-r--r-- 1 mindspore mindspore   9846  9月 28 13:17  Jupyter操作文档.ipynb
+-rw-r--r-- 1 mindspore mindspore  20558  9月 28 13:17 'Graph Mode加速.ipynb'
+-rw-r--r-- 1 mindspore mindspore  13985  9月 28 13:17 '张量 Tensor.ipynb'
+-rw-r--r-- 1 mindspore mindspore  13685  9月 28 13:17  网络构建.ipynb
+-rw-r--r-- 1 mindspore mindspore  60611  9月 28 13:17  数据加载与处理.ipynb
+-rw-r--r-- 1 mindspore mindspore 403563  9月 28 13:17  傻瓜式教程.ipynb
+-rw-r--r-- 1 mindspore mindspore  14050  9月 28 13:17  模型训练.ipynb
+-rw-r--r-- 1 mindspore mindspore  17572  9月 28 13:17  快速入门.ipynb
+-rw-r--r-- 1 mindspore mindspore   4789  9月 28 13:17  基本介绍.ipynb
+-rw-r--r-- 1 mindspore mindspore  15088  9月 28 13:17  函数式自动微分.ipynb
+-rw-r--r-- 1 mindspore mindspore   8294  9月 28 13:17  保存与加载.ipynb
+-rw-r--r-- 1 mindspore mindspore  22991 11月 10 10:38  dlpack-verify.zip
+drwx------ 2 mindspore mindspore   4096 11月 10 10:42  offload
+drwxr-xr-x 3 mindspore mindspore   4096 11月 10 10:44  results
+drwxr-xr-x 2 mindspore mindspore   4096 11月 10 12:29  scripts
+-rw-r--r-- 1 mindspore mindspore    632 11月 10 12:31  fusion_result.json
+-rw-r--r-- 1 mindspore mindspore   1519 11月 10  2026  requirements-npu.txt
+-rw-r--r-- 1 mindspore mindspore   1144 11月 10  2026  requirements-cpu.txt

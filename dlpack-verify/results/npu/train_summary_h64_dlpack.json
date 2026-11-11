@@ -1,0 +1,40 @@
+{
+  "kind": "train_hybrid",
+  "device": "npu:0",
+  "hidden": 64,
+  "batch": 128,
+  "lr": 0.05,
+  "steps": 300,
+  "seed": 7,
+  "exchange": "dlpack",
+  "rtol": 0.005,
+  "m3_tol": 0.02,
+  "results": {
+    "initial_loss_a": 0.15311530232429504,
+    "initial_loss_b": 0.15311530232429504,
+    "final_loss_a": 0.00448827538639307,
+    "final_loss_b": 0.004477296024560928,
+    "ratio_final": 0.9975537682323532,
+    "eval_a": 0.006821471266448498,
+    "eval_b": 0.006813785061240196,
+    "eval_ratio": 0.9988732335139919,
+    "lat_a_ms": 1.0348294551173847,
+    "lat_b_ms": 2.01508238290747,
+    "lat_ratio": 1.947260365408609,
+    "curve_dev_decades": 0.08680085693211614,
+    "auc_dev_decades": 0.004214766539393233,
+    "exchange_fwd_us": 54.85025544961294,
+    "exchange_bwd_us": 52.4309774239858,
+    "m1": true,
+    "m2": true,
+    "m3": false,
+    "m4": true
+  },
+  "m4_calibration": {
+    "rel_err": 0.0,
+    "rtol": 0.005,
+    "pass": true
+  },
+  "initial_consistency_dev": 0.0,
+  "generated_at": "2026-11-10T12:32:12"
+}

@@ -32,6 +32,8 @@ verify_dlpack.py — MindSpore ↔ PyTorch (DLPack) 验证脚本
     python verify_dlpack.py --device npu    # 强制 NPU (910B)
 """
 import argparse
+import json
+import os
 import sys
 import time
 import warnings
@@ -54,6 +56,7 @@ from torch.utils.dlpack import from_dlpack as torch_from_dlpack
 
 LR = 0.01                      # 两侧共用的学习率 (最朴素 SGD)
 results = []                   # 验证结果收集: (step, name, ok, detail)
+MEAS = {}                      # 实测数值收集 (供 make_report.py 生成报告)
 
 # 全局运行时配置, setup_frameworks() 里赋值
 DEVICE = MS_TARGET = None
@@ -130,6 +133,9 @@ def setup_frameworks(args):
     print(f"DLPack 验证  device={DEVICE}  device_target={MS_TARGET}")
     print(f"numpy={np.__version__}  torch={torch.__version__}  "
           f"mindspore={ms.__version__}  mode=PYNATIVE")
+    MEAS["env"] = {"python": sys.version.split()[0], "numpy": np.__version__,
+                   "torch": torch.__version__, "mindspore": ms.__version__,
+                   "device": DEVICE}
     print("=" * 78)
 
 
@@ -288,12 +294,18 @@ def step6_numeric_check(ctx):
     db1_ref = dy.reshape(-1)            # (4,)
 
     g = ctx["g"]
+    MEAS["loss_torch"] = loss_torch
+    MEAS["loss_ref"] = loss_ref
+    MEAS["rel_grad_pt"] = rel_err(g, dy)
+    MEAS["rel_grad_w"] = rel_err(pg_w, dW1_ref) if "pg_w" in dir() else None
     check(6, "两框架前向 loss 一致", rel_err(loss_torch, loss_ref) < RTOL,
           f"torch={loss_torch:.8f} vs 解析={loss_ref:.8f}")
     check(6, "pt_input.grad == 解析解 d(loss)/d(ms_out)", rel_err(g, dy) < RTOL,
           f"rel_err={rel_err(g, dy):.3e}")
     pg_w = ctx["param_grads"][0].asnumpy().astype(np.float64)
     pg_b = ctx["param_grads"][1].asnumpy().astype(np.float64)
+    MEAS["rel_grad_w"] = rel_err(pg_w, dW1_ref)
+    MEAS["rel_grad_b"] = rel_err(pg_b, db1_ref)
     check(6, "MS weight 梯度 == 解析解 d(loss)/dW1", rel_err(pg_w, dW1_ref) < RTOL,
           f"rel_err={rel_err(pg_w, dW1_ref):.3e}")
     check(6, "MS bias 梯度 == 解析解 d(loss)/db1", rel_err(pg_b, db1_ref) < RTOL,
@@ -310,6 +322,7 @@ def step7_negative_control(ctx):
     sens_fake = ops.ones_like(ctx["ms_out"])
     pg_fake = ctx["ms_grad_fn"](ms.Tensor(ctx["x_np"]), sens_fake)
     diff_w = float(np.max(np.abs(pg_fake[0].asnumpy() - ctx["pg_w"])))
+    MEAS["negctrl_diff_w"] = diff_w
     check(7, "假 sens 梯度 ≠ 真实桥接梯度", diff_w > 1e-6, f"max|ΔW|={diff_w:.3e}")
 
 
@@ -329,6 +342,8 @@ def step8_update_params(ctx):
         p.set_data(p - LR * gg)      # 最朴素 SGD: w = w - lr * grad (算术返回 Tensor, set_data 写回)
     pt_moved = float(np.max(np.abs(to_np(pt_head.weight) - pt_w_before)))
     ms_moved = float(np.max(np.abs(ms_block.fc.weight.asnumpy() - ms_w_before)))
+    MEAS["pt_moved"] = pt_moved
+    MEAS["ms_moved"] = ms_moved
     check(8, "PyTorch 参数已更新", pt_moved > 0, f"max|Δw|={pt_moved:.3e}")
     check(8, "MindSpore 参数已更新", ms_moved > 0, f"max|Δw|={ms_moved:.3e}")
 
@@ -349,6 +364,8 @@ def step9_benchmark(ctx):
     for _ in range(N):
         _v = torch.from_numpy(src.asnumpy().copy())
     t_copy = (time.perf_counter() - t0) / N * 1e6
+    MEAS["t_dlpack_us"] = t_dlpack
+    MEAS["t_copy_us"] = t_copy
     print(f"  dlpack 交换: {t_dlpack:8.1f} us/次   |  "
           f"拷贝路径(asnumpy→torch): {t_copy:8.1f} us/次")
 
@@ -370,6 +387,21 @@ def report():
         print("结论: 全部通过 — DLPack 交换/零拷贝/梯度桥接机制在该环境成立。")
     else:
         print("结论: 存在失败项, 见上方 FAIL 明细 (失败原因与移植建议见 README)。")
+    dev = "npu" if DEVICE.startswith("npu") else "cpu"
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "results", dev)
+    os.makedirs(out_dir, exist_ok=True)
+    summary = {"kind": "verify_dlpack", "device": DEVICE, "env": MEAS.get("env", {}),
+               "n_pass": n_pass, "n_total": len(results),
+               "checks": [{"step": s, "name": n, "ok": bool(ok), "detail": str(d)}
+                          for s, n, ok, d in results],
+               "meas": {k: (bool(v) if isinstance(v, (bool, np.bool_)) else
+                            float(v) if isinstance(v, (np.floating, np.integer))
+                            else v)
+                        for k, v in MEAS.items() if k != "env"}}
+    with open(os.path.join(out_dir, "verify_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"机器可读摘要已写入: {os.path.abspath(os.path.join(out_dir, 'verify_summary.json'))}")
     return 0 if n_pass == len(results) else 1
 
 

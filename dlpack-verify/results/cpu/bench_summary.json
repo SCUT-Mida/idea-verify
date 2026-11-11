@@ -1,0 +1,9 @@
+{
+  "kind": "bench",
+  "device": "cpu",
+  "fwd_dlpack_us": 15.61650016810745,
+  "fwd_copy_us": 33.80450012627989,
+  "bwd_dlpack_us": 7.191500044427812,
+  "bwd_copy_us": 28.60949985915795,
+  "n": 200
+}
